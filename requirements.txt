@@ -1,0 +1,13 @@
+torch
+torchvision
+torchaudio
+sentencepiece
+transformers
+accelerate
+datasets
+six
+torch-summary
+av
+jiwer
+wandb
+python_speech_features==0.6

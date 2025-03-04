@@ -1,0 +1,78 @@
+from src.nets.backend.e2e_asr_conformer import E2E
+from transformers.modeling_utils import PreTrainedModel
+from src.auto_vsr.configuration_vsr import AutoVSRConfig
+from src.nets.batch_beam_search import BatchBeamSearch
+from src.nets.scorers.length_bonus import LengthBonus
+from src.nets.scorers.ctc import CTCPrefixScorer
+import torch
+from transformers.utils import ModelOutput
+from typing import List, Optional, Union
+from dataclasses import dataclass
+
+def get_beam_search_decoder(model, token_list, ctc_weight=0.1, beam_size=3):
+    scorers = {
+        "decoder": model.decoder,
+        "ctc": CTCPrefixScorer(model.ctc, model.eos),
+        "length_bonus": LengthBonus(len(token_list)),
+        "lm": None
+    }
+
+    weights = {
+        "decoder": 1.0 - ctc_weight,
+        "ctc": ctc_weight,
+        "lm": 0.0,
+        "length_bonus": 0.0,
+    }
+
+    return BatchBeamSearch(
+        beam_size=beam_size,
+        vocab_size=len(token_list),
+        weights=weights,
+        scorers=scorers,
+        sos=model.sos,
+        eos=model.eos,
+        token_list=token_list,
+        pre_beam_score_key=None if ctc_weight == 1.0 else "decoder",
+    )
+
+@dataclass
+class AutoVSROutput(ModelOutput):
+    loss: Optional[torch.FloatTensor] = None
+    loss_ctc: Optional[torch.FloatTensor] = None
+    loss_att: Optional[torch.FloatTensor] = None
+    acc: Optional[torch.FloatTensor] = None
+
+class AutoVSR(PreTrainedModel):
+    config_class = AutoVSRConfig
+    
+    def __init__(self, config: AutoVSRConfig):
+        super().__init__(config)
+        self.vsr = E2E(config)
+    
+    def forward(self, 
+        videos, 
+        audios, 
+        labels,
+        video_lengths, 
+        audio_lengths, 
+        label_lengths
+    ):  
+        loss, loss_ctc, loss_att, acc = self.vsr(videos, video_lengths, labels)
+        return AutoVSROutput(
+            loss=loss,
+            loss_ctc=loss_ctc,
+            loss_att=loss_att,
+            acc=acc
+        )
+    
+    def inference(self, sample, text_transform):
+        
+        self.beam_search = get_beam_search_decoder(self.vsr, text_transform.token_list)
+        enc_feat, _ = self.vsr.encoder(sample.unsqueeze(0).to(self.device), None)
+        enc_feat = enc_feat.squeeze(0)
+
+        nbest_hyps = self.beam_search(enc_feat)
+        nbest_hyps = [h.asdict() for h in nbest_hyps[: min(len(nbest_hyps), 1)]]
+        predicted_token_id = torch.tensor(list(map(int, nbest_hyps[0]["yseq"][1:])))
+        predicted = text_transform.post_process(predicted_token_id).replace("<eos>", "")
+        return predicted
