@@ -1,4 +1,5 @@
 from transformers.trainer import *
+from typing import Callable, Dict, List, Optional, Tuple, Union, Type
 
 class AVSRTrainer(Trainer):
     
@@ -9,7 +10,7 @@ class AVSRTrainer(Trainer):
         data_collator: any = None,
         valid_data_collator: any = None,
         train_dataset: Optional[Union[Dataset, IterableDataset, "datasets.Dataset"]] = None,
-        eval_dataset: Optional[Union[Dataset, Dict[str, Dataset], "datasets.Dataset"]] = None,
+        eval_dataset: Optional[Union[Dataset, IterableDataset, "datasets.Dataset"]] = None,
         processing_class: Optional[
             Union[PreTrainedTokenizerBase, BaseImageProcessor, FeatureExtractionMixin, ProcessorMixin]
         ] = None,

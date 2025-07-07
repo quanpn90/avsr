@@ -3,6 +3,12 @@ import os
 import torch
 import torchaudio
 import torchvision
+from torchcodec.decoders import VideoDecoder
+# check if AudioDecoder is available
+try:
+    from torchcodec.decoders import AudioDecoder
+except ImportError:
+    AudioDecoder = None
 import random
 from dataclasses import dataclass
 from src.tokenizer.spm_tokenizer import TextTransform
@@ -22,26 +28,35 @@ def cut_or_pad(data, size, dim=0):
     return data
 
 
-def load_video(path):
+def load_video(path, start_time=0, end_time=None):
     """
     rtype: torch, T x C x H x W
     """
-    vid = torchvision.io.read_video(path, pts_unit="sec", output_format="THWC")[0]
-    vid = vid.permute((0, 3, 1, 2))
+    video_decoder = VideoDecoder(path, dimension_order="NCHW")
+    if end_time is None:
+        end_time = video_decoder.metadata.duration_seconds
+    vid = video_decoder.get_frames_played_in_range(start_time, end_time).data
     return vid
 
-
-def load_audio(path):
+def load_audio(path, start_time=0, end_time=None):
     """
     rtype: torch, T x 1
     """
-    
-    if path.endswith(".mp4") and os.path.exists(path.replace(".mp4", ".wav")):
-        waveform, sample_rate = torchaudio.load(path.replace(".mp4", ".wav"), normalize=True)
+    if AudioDecoder is not None:
+        audio_decoder = AudioDecoder(path)
+        if end_time is None:
+            end_time = audio_decoder.metadata.duration_seconds_from_header
+        waveform = audio_decoder.get_samples_played_in_range(start_time, end_time).data
     else:
-        waveform, sample_rate = torchaudio.load(path, normalize=True)
-    assert sample_rate == 16000
-    return waveform.transpose(1, 0)
+        if start_time == 0 and end_time is None:
+            frame_offset = 0
+            num_frames = -1
+        else:
+            frame_offset = int(start_time * 16000)
+            num_frames = int((end_time - start_time) * 16000)
+        waveform, sample_rate = torchaudio.load(path, frame_offset=frame_offset, num_frames=num_frames, normalize=True)
+        assert sample_rate == 16000
+    return waveform.transpose(1, 0)  # T x 1
     
 
 def normalize_audio(waveform):
@@ -249,17 +264,27 @@ class DataCollator:
         # {"video": video, "audio": audio, "target": token_id}
         samples = []
         for feature in features:
-            video = load_video(feature["video"])
+            if "start_time" in feature and "end_time" in feature:
+                video = load_video(feature["video"], feature["start_time"], feature["end_time"])
+            else:
+                video = load_video(feature["video"])
 
-            audio = load_audio(feature["video"])
+            if "start_time" in feature and "end_time" in feature:
+                audio = load_audio(feature["video"], feature["start_time"], feature["end_time"])
+            else:
+                audio = load_audio(feature["video"])
+            
             audio = cut_or_pad(audio, len(video) * self.rate_ratio)
             
             video = self.video_transform(video)
             audio = self.audio_transform(audio)
-            label = self.text_transform.tokenize(feature["label"])
             
-            samples.append({"video": video, "audio": audio, "label": label})
-        
+            if "label" in feature:
+                label = self.text_transform.tokenize(feature["label"])
+                samples.append({"video": video, "audio": audio, "label": label})
+            else:
+                samples.append({"video": video, "audio": audio})
+            
         batch = collate_pad(samples)
         
         return batch

@@ -195,4 +195,12 @@ pyrightconfig.json
 # End of https://www.toptal.com/developers/gitignore/api/python,visualstudiocode
 
 .cache/*
-model-bin/
+model-bin
+data-bin
+wandb
+src/ibug/**/weights/*
+src/ibug/**/weights/*
+
+script/_*.py
+cache/*
+log_*.txt

@@ -138,7 +138,7 @@ if __name__ == "__main__":
     print(norm_string("t_qua ng'_123"))
     
     test_cases = [
-        ["I'm Binh i'm 25 years old i'm a AI researcher.", "I'M BINH I'M 25 YEARS OLD I'M A AI RESEARCHER"],   
+        ["I'm Binh i'm 25 years old i'm a AI researcher. It's a good day.", "I'M BINH I'M 25 YEARS OLD I'M A AI RESEARCHER IT'S A GOOD DAY"],   
     ]
     
     for text, ref in test_cases:
