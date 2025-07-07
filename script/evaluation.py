@@ -1,6 +1,5 @@
 import os
 import sys
-os.environ['CUDA_VISIBLE_DEVICES'] = '3'
 sys.path.append(os.path.join(os.path.dirname(os.path.dirname(__file__))))
 import argparse
 import json
