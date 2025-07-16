@@ -35,7 +35,7 @@ class MultiHeadedAttention(nn.Module):
         self.attn = None
         self.dropout = nn.Dropout(p=dropout_rate)
 
-    def forward_qkv(self, query, key, value):
+    def forward_qkv(self, query, key, value, packed=False):
         """Transform query, key and value.
         Args:
             query (torch.Tensor): Query tensor (#batch, time1, size).
@@ -70,9 +70,10 @@ class MultiHeadedAttention(nn.Module):
         n_batch = value.size(0)
         if mask is not None:
             mask = mask.unsqueeze(1).eq(0)  # (batch, 1, *, time2)
-            min_value = float(
-                numpy.finfo(torch.tensor(0, dtype=scores.dtype).numpy().dtype).min
-            )
+            # min_value = float(
+            #     numpy.finfo(torch.tensor(0, dtype=scores.dtype).numpy().dtype).min
+            # )
+            min_value = float(torch.finfo(scores.dtype).min)
             scores = scores.masked_fill(mask, min_value)
             self.attn = torch.softmax(scores, dim=-1).masked_fill(
                 mask, 0.0
@@ -104,6 +105,7 @@ class MultiHeadedAttention(nn.Module):
         q, k, v = self.forward_qkv(query, key, value)
         scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.d_k)
         return self.forward_attention(v, scores, mask, rtn_attn)
+
 
 
 class LegacyRelPositionMultiHeadedAttention(MultiHeadedAttention):

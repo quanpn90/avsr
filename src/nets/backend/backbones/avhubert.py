@@ -4,12 +4,16 @@ from torch import nn
 from typing import Dict, List, Optional, Tuple, Any
 from transformers import PreTrainedModel, Wav2Vec2Config
 from transformers.models.wav2vec2.modeling_wav2vec2 import (
-    Wav2Vec2Encoder, Wav2Vec2EncoderLayer, 
+    Wav2Vec2Encoder, Wav2Vec2EncoderLayer,
     is_deepspeed_zero3_enabled
 )
 from copy import deepcopy
 from transformers.modeling_outputs import BaseModelOutput
 from src.nets.backend.backbones.resnet import ResEncoder
+from src.nets.backend.backbones.modules.flash_attention_utils import index_first_axis, pad_input, _get_unpad_data
+from src.nets.backend.backbones.modules.flash_attention_utils import FlashAttentionKwargs
+from src.nets.backend.backbones.modules.avhubert_attention import AVHuBERTFlashAttention2
+
 
 def find_runs(x):
     """Find runs of consecutive items in an array."""
@@ -41,15 +45,15 @@ def find_runs(x):
 
 
 def compute_mask_indices(
-    shape: Tuple[int, int],
-    padding_mask: Optional[torch.Tensor],
-    mask_prob: float,
-    mask_length: int,
-    mask_type: str = "static",
-    mask_other: float = 0.0,
-    min_masks: int = 0,
-    no_overlap: bool = False,
-    min_space: int = 0,
+        shape: Tuple[int, int],
+        padding_mask: Optional[torch.Tensor],
+        mask_prob: float,
+        mask_length: int,
+        mask_type: str = "static",
+        mask_other: float = 0.0,
+        min_masks: int = 0,
+        no_overlap: bool = False,
+        min_space: int = 0,
 ) -> np.ndarray:
     """
     Computes random mask spans for a given shape
@@ -166,9 +170,11 @@ def compute_mask_indices(
         vals, run_starts, run_lengths = find_runs(mask[i])
         start_indices, lengths = run_starts[vals == True], run_lengths[vals == True]
         starts.append(start_indices)
-        ends.append(start_indices+lengths)
-        batch_indexes.append(np.zeros([len(start_indices)])+i)
-    return mask, np.concatenate(starts).astype(np.int64), np.concatenate(ends).astype(np.int64), np.concatenate(batch_indexes).astype(np.int64)
+        ends.append(start_indices + lengths)
+        batch_indexes.append(np.zeros([len(start_indices)]) + i)
+    return mask, np.concatenate(starts).astype(np.int64), np.concatenate(ends).astype(np.int64), np.concatenate(
+        batch_indexes).astype(np.int64)
+
 
 class GradMultiply(torch.autograd.Function):
     @staticmethod
@@ -181,8 +187,10 @@ class GradMultiply(torch.autograd.Function):
     def backward(ctx, grad):
         return grad * ctx.scale, None
 
+
 def LayerNorm(normalized_shape, eps=1e-5, elementwise_affine=True, export=False):
     return torch.nn.LayerNorm(normalized_shape, eps, elementwise_affine)
+
 
 class SubModel(nn.Module):
     def __init__(self, resnet=None, input_dim=None, cfg=None):
@@ -197,17 +205,19 @@ class SubModel(nn.Module):
         x = x.transpose(1, 2)
         return x
 
+
 class AVHubertModel(PreTrainedModel):
     config_class = Wav2Vec2Config
     base_model_prefix = "avhubert"
+
     # main_input_name = "input_values"
     # supports_gradient_checkpointing = True
     # _supports_flash_attn_2 = True
     # _supports_sdpa = True
-    
+
     def __init__(
-        self,
-        cfg: Wav2Vec2Config,
+            self,
+            cfg: Wav2Vec2Config,
     ) -> None:
         super().__init__(cfg)
         # logger.info(f"HubertModel Config: {cfg}")
@@ -263,11 +273,12 @@ class AVHubertModel(PreTrainedModel):
         )
 
         self.mask_emb = nn.Parameter(
-            torch.FloatTensor(cfg.audio_feat_dim).uniform_() if self.masking_type == 'input' else torch.FloatTensor(cfg.encoder_embed_dim).uniform_()
+            torch.FloatTensor(cfg.audio_feat_dim).uniform_() if self.masking_type == 'input' else torch.FloatTensor(
+                cfg.encoder_embed_dim).uniform_()
         )
 
         self.encoder = AVHubertEncoder(cfg)
-        
+
         self.layer_norm = LayerNorm(self.embed)
 
         self.target_glu = None
@@ -289,6 +300,8 @@ class AVHubertModel(PreTrainedModel):
             torch.FloatTensor(sum(self.num_classes), final_dim)
         )
         nn.init.uniform_(self.label_embs_concat)
+
+        self._use_flash_attention_2 = False
 
     def upgrade_state_dict_named(self, state_dict, name):
         """Upgrade a (possibly old) state dict for new versions of fairseq."""
@@ -318,7 +331,7 @@ class AVHubertModel(PreTrainedModel):
             )
             mask_indices_np = mask_indices
             mask_indices = torch.from_numpy(mask_indices).to(x.device)
-            x = x.transpose(1, 2).contiguous() # [B, T, C, H, W]
+            x = x.transpose(1, 2).contiguous()  # [B, T, C, H, W]
             if B == 1:
                 x[mask_indices] = 0
             elif is_audio:
@@ -330,15 +343,15 @@ class AVHubertModel(PreTrainedModel):
             elif self.selection_type == 'same_seq':
                 batch_indexes_, other_indexes = [], []
                 for batch_index, start, end in zip(batch_indexes, starts, ends):
-                    length = end-start
-                    other_start = np.setdiff1d(np.arange(T), np.arange(max(0, start-length), end))
+                    length = end - start
+                    other_start = np.setdiff1d(np.arange(T), np.arange(max(0, start - length), end))
                     if len(other_start) > 0:
                         other_start = np.random.choice(other_start, size=1)
                     else:
                         other_start = 0
                     other_end = other_start + length
-                    other_indexes.append(np.arange(other_start, other_end).clip(max=T-1))
-                    batch_indexes_.append(np.zeros([length], dtype=np.int64)+batch_index)
+                    other_indexes.append(np.arange(other_start, other_end).clip(max=T - 1))
+                    batch_indexes_.append(np.zeros([length], dtype=np.int64) + batch_index)
                 batch_indexes, other_indexes = np.concatenate(batch_indexes_), np.concatenate(other_indexes)
                 x[mask_indices] = x[batch_indexes, other_indexes]
 
@@ -419,7 +432,7 @@ class AVHubertModel(PreTrainedModel):
         return features, mask_indices, target_list
 
     def forward_padding_mask(
-        self, features: torch.Tensor, padding_mask: torch.Tensor,
+            self, features: torch.Tensor, padding_mask: torch.Tensor,
     ) -> torch.Tensor:
         extra = padding_mask.size(1) % features.size(1)
         if extra > 0:
@@ -437,23 +450,24 @@ class AVHubertModel(PreTrainedModel):
         elif self.sim_type == 'cosine':
             batch_size, timesteps, emb_dim = feats.size()
             feats_ = feats.view(-1, emb_dim)
-            nom = (feats_.unsqueeze(dim=1) * emb_mat.unsqueeze(dim=0)).sum(dim=-1) # [B*T, V]
-            denom = (feats_**2).sum(dim=-1).sqrt().unsqueeze(dim=1) * (emb_mat**2).sum(dim=-1).sqrt().unsqueeze(dim=0) # [B*T, V]
-            logits = (nom/denom.clamp(min=1e-6)).view(batch_size, timesteps, -1)
+            nom = (feats_.unsqueeze(dim=1) * emb_mat.unsqueeze(dim=0)).sum(dim=-1)  # [B*T, V]
+            denom = (feats_ ** 2).sum(dim=-1).sqrt().unsqueeze(dim=1) * (emb_mat ** 2).sum(dim=-1).sqrt().unsqueeze(
+                dim=0)  # [B*T, V]
+            logits = (nom / denom.clamp(min=1e-6)).view(batch_size, timesteps, -1)
         else:
             raise NotImplementedError
         logits = logits / self.logit_temp
         return logits
 
     def forward_gen(
-        self,
-        source: torch.Tensor,
-        target_list: Optional[List[torch.Tensor]] = None,
-        padding_mask: Optional[torch.Tensor] = None,
-        mask: bool = True,
-        features_only: bool = False,
-        output_layer: Optional[int] = None,
-        video: Optional[torch.Tensor] = None,
+            self,
+            source: torch.Tensor,
+            target_list: Optional[List[torch.Tensor]] = None,
+            padding_mask: Optional[torch.Tensor] = None,
+            mask: bool = True,
+            features_only: bool = False,
+            output_layer: Optional[int] = None,
+            video: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """output layer is 1-based"""
         src_audio, src_video = source['audio'], source['video']
@@ -464,10 +478,9 @@ class AVHubertModel(PreTrainedModel):
         else:
             src_audio, src_video, mask_indices = src_audio, src_video, None
 
-        features_audio = self.forward_features(src_audio, modality='audio') # features: [B, F, T]
+        features_audio = self.forward_features(src_audio, modality='audio')  # features: [B, F, T]
         features_video = self.forward_features(src_video, modality='video')
-        
-        
+
         if self.modality == 'audio':
             features_video = 0 * features_video
         elif self.modality == 'video':
@@ -480,9 +493,7 @@ class AVHubertModel(PreTrainedModel):
                         features_audio = 0 * features_audio
                     else:
                         features_video = 0 * features_video
-                    
 
-        
         if self.modality_fuse == 'concat':
             features = torch.cat([features_audio, features_video], dim=1)
         elif self.modality_fuse == 'add':
@@ -512,7 +523,7 @@ class AVHubertModel(PreTrainedModel):
         # x: (B, T, D), float
         # padding_mask: (B, T), bool
         # mask_indices: (B, T), bool
-        
+
         x = self.encoder(x, attention_mask=padding_mask)[0]
         # x = self.encoder(
         #     x,
@@ -529,10 +540,14 @@ class AVHubertModel(PreTrainedModel):
             proj_x_list = proj_x.chunk(len(self.num_classes), dim=-1)
         else:
             proj_x_list = [proj_x for _ in self.num_classes]
-        logit_list = [self.compute_logits(proj, emb).view(-1, num_class) for proj, emb, num_class in zip(proj_x_list, label_embs_list, self.num_classes)] # [[B*T, V]]
-        mask, unmask = torch.logical_and(mask_indices, ~padding_mask).view(-1), torch.logical_and(~mask_indices, ~padding_mask).view(-1) # [B*T]
+        logit_list = [self.compute_logits(proj, emb).view(-1, num_class) for proj, emb, num_class in
+                      zip(proj_x_list, label_embs_list, self.num_classes)]  # [[B*T, V]]
+        mask, unmask = torch.logical_and(mask_indices, ~padding_mask).view(-1), torch.logical_and(~mask_indices,
+                                                                                                  ~padding_mask).view(
+            -1)  # [B*T]
         logit_m_list, logit_u_list = [logit[mask] for logit in logit_list], [logit[unmask] for logit in logit_list]
-        target_m_list, target_u_list = [target.view(-1)[mask].long() for target in target_list], [target.view(-1)[unmask].long() for target in target_list]
+        target_m_list, target_u_list = [target.view(-1)[mask].long() for target in target_list], [
+            target.view(-1)[unmask].long() for target in target_list]
         result = {
             "logit_m_list": logit_m_list,
             "logit_u_list": logit_u_list,
@@ -544,11 +559,11 @@ class AVHubertModel(PreTrainedModel):
         return result
 
     def forward(
-        self,
-        input_features: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        video: torch.Tensor = None,
-        **kwargs,
+            self,
+            input_features: torch.Tensor,
+            attention_mask: Optional[torch.Tensor] = None,
+            video: torch.Tensor = None,
+            **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         res = self.forward_gen(
             {"audio": input_features, "video": video},
@@ -561,12 +576,12 @@ class AVHubertModel(PreTrainedModel):
         return BaseModelOutput(last_hidden_state=feature, hidden_states=None, attentions=None)
 
     def extract_features(
-        self,
-        source: torch.Tensor,
-        padding_mask: Optional[torch.Tensor] = None,
-        mask: bool = False,
-        ret_conv: bool = False,
-        output_layer: Optional[int] = None,
+            self,
+            source: torch.Tensor,
+            padding_mask: Optional[torch.Tensor] = None,
+            mask: bool = False,
+            ret_conv: bool = False,
+            output_layer: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         res = self.forward_gen(
             source,
@@ -583,19 +598,22 @@ class AVHubertModel(PreTrainedModel):
         if mask and self.masking_type == 'input':
             src_video, mask_indices_video = self.apply_input_mask(src_video, padding_mask, target_list=None)
             src_audio, mask_indices_audio = self.apply_input_mask(src_audio, padding_mask, target_list=None)
-            mask_indices = torch.logical_or(mask_indices_audio, mask_indices_video) # mask_indices not used in fine-tuning
+            mask_indices = torch.logical_or(mask_indices_audio,
+                                            mask_indices_video)  # mask_indices not used in fine-tuning
         else:
             src_audio, src_video, mask_indices = src_audio, src_video, None
 
         if src_audio is not None and src_video is None:
-            features_audio = self.forward_features(src_audio, modality='audio') # features: [B, F, T]
-            features_video = features_audio.new_zeros(features_audio.size(0), self.encoder_embed_dim, features_audio.size(-1))
+            features_audio = self.forward_features(src_audio, modality='audio')  # features: [B, F, T]
+            features_video = features_audio.new_zeros(features_audio.size(0), self.encoder_embed_dim,
+                                                      features_audio.size(-1))
         elif src_audio is None and src_video is not None:
             features_video = self.forward_features(src_video, modality='video')
-            features_audio = features_video.new_zeros(features_video.size(0), self.encoder_embed_dim, features_video.size(-1))
+            features_audio = features_video.new_zeros(features_video.size(0), self.encoder_embed_dim,
+                                                      features_video.size(-1))
         elif src_audio is not None and src_video is not None:
             features_video = self.forward_features(src_video, modality='video')
-            features_audio = self.forward_features(src_audio, modality='audio') # features: [B, F, T]
+            features_audio = self.forward_features(src_audio, modality='audio')  # features: [B, F, T]
 
         if self.modality_fuse == 'concat':
             features = torch.cat([features_audio, features_video], dim=1)
@@ -631,7 +649,6 @@ class AVHubertModel(PreTrainedModel):
 
         return x, padding_mask
 
-
     def get_extra_losses(self, net_output):
         extra_losses = []
         names = []
@@ -665,17 +682,21 @@ class AVHubertModel(PreTrainedModel):
         logits = logits.transpose(0, 1)  # (num_x, num_cls+1)
         return logits
 
+
 class AVHubertEncoder(Wav2Vec2Encoder):
     def __init__(self, config):
         super().__init__(config)
         self.layers = nn.ModuleList([AVHubertEncoderLayer(config) for _ in range(config.num_hidden_layers)])
+        self._attn_implementation = config._attn_implementation
+        self._use_flash_attention_2 = (config._attn_implementation == "flash_attention_2")
+
     def forward(
-        self,
-        hidden_states: torch.tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        output_attentions: bool = False,
-        output_hidden_states: bool = False,
-        return_dict: bool = True,
+            self,
+            hidden_states: torch.tensor,
+            attention_mask: Optional[torch.Tensor] = None,
+            output_attentions: bool = False,
+            output_hidden_states: bool = False,
+            return_dict: bool = True,
     ):
         all_hidden_states = () if output_hidden_states else None
         all_self_attentions = () if output_attentions else None
@@ -702,6 +723,33 @@ class AVHubertEncoder(Wav2Vec2Encoder):
 
         deepspeed_zero3_is_enabled = is_deepspeed_zero3_enabled()
 
+        batch_size, seq_len, hidden_size = hidden_states.shape
+
+        if self._attn_implementation == "flash_attention_2" and not self.gradient_checkpointing:
+
+            # TODO: prepare data for flash attention
+            if attention_mask is None:
+                attention_mask = torch.ones((batch_size, seq_len), dtype=torch.bool, device=hidden_states.device)
+            indices_k, cu_seq_lens_k, max_seqlen_in_batch_k = _get_unpad_data(attention_mask)
+
+            query_len = seq_len
+            # else:
+
+            packed_hidden_states = index_first_axis(hidden_states.view(-1, hidden_states.size(-1)), indices_k)
+            flash_kwargs: FlashAttentionKwargs = {
+                "cu_seq_lens_q": cu_seq_lens_k,
+                "cu_seq_lens_k": cu_seq_lens_k,
+                "max_length_q": max_seqlen_in_batch_k,
+                "max_length_k": max_seqlen_in_batch_k,
+                "query_length": query_len,
+                "totals": packed_hidden_states.size(0)
+            }
+
+            hidden_states = packed_hidden_states
+        else:
+            indices_k = None
+            flash_kwargs = None
+
         for layer in self.layers:
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
@@ -721,7 +769,8 @@ class AVHubertEncoder(Wav2Vec2Encoder):
                     )
                 else:
                     layer_outputs = layer(
-                        hidden_states, attention_mask=attention_mask, output_attentions=output_attentions
+                        hidden_states, attention_mask=attention_mask, output_attentions=output_attentions,
+                        flash_kwargs=flash_kwargs
                     )
                 hidden_states = layer_outputs[0]
 
@@ -736,6 +785,10 @@ class AVHubertEncoder(Wav2Vec2Encoder):
         if output_hidden_states:
             all_hidden_states = all_hidden_states + (hidden_states,)
 
+        if self._attn_implementation == "flash_attention_2" and not self.gradient_checkpointing:
+            # pad the data again
+            hidden_states = pad_input(hidden_states, indices_k, batch_size, seq_len)
+
         if not return_dict:
             return tuple(v for v in [hidden_states, all_hidden_states, all_self_attentions] if v is not None)
         return BaseModelOutput(
@@ -743,13 +796,42 @@ class AVHubertEncoder(Wav2Vec2Encoder):
             hidden_states=all_hidden_states,
             attentions=all_self_attentions,
         )
-        
+
+
 class AVHubertEncoderLayer(Wav2Vec2EncoderLayer):
-    def forward(self, hidden_states, attention_mask=None, output_attentions=False):
+
+    def __init__(self, config):
+        # config._attn_implementation = "eager"  # for debugging
+        super().__init__(config)
+        self._attn_implementation = config._attn_implementation
+
+        # Override the attention module with your AVHubertFlashAttention2
+        if config._attn_implementation == "flash_attention_2":
+            self.attention = AVHuBERTFlashAttention2(
+                embed_dim=config.hidden_size,
+                num_heads=config.num_attention_heads,
+                dropout=config.attention_dropout,
+                is_decoder=False,
+            )
+
+    def forward(self, hidden_states, attention_mask=None, output_attentions=False,
+                flash_kwargs=None, **kwargs):
+
         attn_residual = hidden_states
         hidden_states = self.layer_norm(hidden_states)
+
+        assert self._attn_implementation == "flash_attention_2" or flash_kwargs is None
+        attn_args = {
+            "hidden_states": hidden_states,
+            "attention_mask": attention_mask,
+            "output_attentions": output_attentions,
+        }
+
+        if self._attn_implementation == "flash_attention_2":
+            attn_args["flash_kwargs"] = flash_kwargs
+
         hidden_states, attn_weights, _ = self.attention(
-            hidden_states, attention_mask=attention_mask, output_attentions=output_attentions
+            **attn_args
         )
         hidden_states = self.dropout(hidden_states)
         hidden_states = attn_residual + hidden_states
