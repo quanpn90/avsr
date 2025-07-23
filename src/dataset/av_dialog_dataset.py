@@ -12,6 +12,7 @@ import numpy as np
 from python_speech_features import logfbank
 import torch.nn.functional as F
 
+
 def cut_or_pad(data, size, dim=0):
     """
     Pads or trims the data along a dimension.
@@ -40,7 +41,7 @@ def load_audio(path):
     """
     rtype: torch, T x 1
     """
-    
+
     if path.endswith(".mp4") and os.path.exists(path.replace(".mp4", ".wav")):
         waveform, sample_rate = torchaudio.load(path.replace(".mp4", ".wav"), normalize=True)
     else:
@@ -68,22 +69,24 @@ class FBanksAndStack(torch.nn.Module):
             res = self.stack_order - len(feats) % self.stack_order
             res = np.zeros([res, feat_dim]).astype(feats.dtype)
             feats = np.concatenate([feats, res], axis=0)
-        feats = feats.reshape((-1, self.stack_order, feat_dim)).reshape(-1, self.stack_order*feat_dim)
+        feats = feats.reshape((-1, self.stack_order, feat_dim)).reshape(-1, self.stack_order * feat_dim)
         return feats
 
     def forward(self, x):
         # x: T x 1
         # return: T x F*stack_order
-        audio_feats = logfbank(x.squeeze().numpy(), samplerate=16000).astype(np.float32) # [T, F]
-        audio_feats = self.stacker(audio_feats) # [T/stack_order_audio, F*stack_order_audio]
-        
+        audio_feats = logfbank(x.squeeze().numpy(), samplerate=16000).astype(np.float32)  # [T, F]
+        audio_feats = self.stacker(audio_feats)  # [T/stack_order_audio, F*stack_order_audio]
+
         with torch.no_grad():
             audio_feats = F.layer_norm(torch.from_numpy(audio_feats), audio_feats.shape[1:])
         return audio_feats
 
+
 def normalize_audio(waveform):
     max_val = torch.abs(waveform).max()
     return waveform / max_val if max_val > 0 else waveform
+
 
 class FunctionalModule(torch.nn.Module):
     def __init__(self, functional):
@@ -119,9 +122,9 @@ class AdaptiveTimeMask(torch.nn.Module):
 
 class AddNoise(torch.nn.Module):
     def __init__(
-        self,
-        noise_filename=None,
-        snr_target=None,
+            self,
+            noise_filename=None,
+            snr_target=None,
     ):
         super().__init__()
         self.snr_levels = [snr_target] if snr_target else [-5, 0, 5, 10, 15, 20, 999999]
@@ -139,17 +142,18 @@ class AddNoise(torch.nn.Module):
             return speech
         speech = speech.t()
         start_idx = random.randint(0, self.noise.shape[1] - speech.shape[1])
-        noise_segment = self.noise[:, start_idx : start_idx + speech.shape[1]]
+        noise_segment = self.noise[:, start_idx: start_idx + speech.shape[1]]
         snr_level = torch.tensor([random.choice(self.snr_levels)])
         noisy_speech = torchaudio.functional.add_noise(speech, noise_segment, snr_level)
         return noisy_speech.t()
-    
+
+
 class AddMultiSpk(torch.nn.Module):
     def __init__(
-        self,
-        speech_dataset=None,
-        snr_target=None,
-        interferer_spk=None,
+            self,
+            speech_dataset=None,
+            snr_target=None,
+            interferer_spk=None,
     ):
         super().__init__()
         self.snr_levels = [snr_target] if snr_target else [-5, 0, 5, 10, 15, 20]
@@ -164,7 +168,7 @@ class AddMultiSpk(torch.nn.Module):
         speech_length = speech.size(0) / 16000
         if speech_length < 2:
             return speech
-        
+
         num_interferer = random.choice(self.interferer_spk)
         interferer_signal = None
         for _ in range(num_interferer):
@@ -177,14 +181,15 @@ class AddMultiSpk(torch.nn.Module):
                     interferer_signal = interferer
                 else:
                     snr_level = torch.tensor([random.choice([-5, 0, 5, 10, 15])])
-                    interferer_signal = torchaudio.functional.add_noise(interferer_signal.t(), interferer.t(), snr_level).t()        
-        
+                    interferer_signal = torchaudio.functional.add_noise(interferer_signal.t(), interferer.t(),
+                                                                        snr_level).t()
+
         if interferer_signal is None:
             return speech
-        
+
         snr_level = torch.tensor([random.choice(self.snr_levels)])
         speech = torchaudio.functional.add_noise(speech.t(), interferer_signal.t(), snr_level).t()
-        
+
         return speech
 
 
@@ -241,7 +246,6 @@ class AudioTransform:
         return self.audio_pipeline(sample)
 
 
-
 # https://github.com/facebookresearch/av_hubert/blob/593d0ae8462be128faab6d866a3a926e2955bde1/avhubert/hubert_dataset.py#L517
 def pad(samples, pad_val=0.0):
     lengths = [len(s) for s in samples]
@@ -275,7 +279,8 @@ def collate_pad(batch):
         batch_out[data_type + "s"] = c_batch
         batch_out[data_type + "_lengths"] = torch.tensor(sample_lengths)
     return batch_out
-    
+
+
 @dataclass
 class DataCollator:
     text_transform: TextTransform = None
@@ -284,7 +289,6 @@ class DataCollator:
     rate_ratio: int = 640
 
     def __call__(self, features: List[Dict[str, Union[List[int], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
-        
         # {"video": video, "audio": audio, "target": token_id}
         samples = []
         for feature in features:
@@ -292,16 +296,16 @@ class DataCollator:
 
             audio = load_audio(feature["video"])
             audio = cut_or_pad(audio, len(video) * self.rate_ratio)
-            
+
             video = self.video_transform(video)
             audio = self.audio_transform(audio)
             label = self.text_transform.tokenize(feature["label"])
-            
+
             samples.append({"video": video, "audio": audio, "label": label})
-        
+
         batch = collate_pad(samples)
-        
+
         batch['videos'] = batch['videos'].permute(0, 2, 1, 3, 4)
         batch['audios'] = batch['audios'].permute(0, 2, 1)
-        
+
         return batch

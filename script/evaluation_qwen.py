@@ -1,5 +1,6 @@
 import os
 import sys
+import re
 
 sys.path.append(os.path.join(os.path.dirname(os.path.dirname(__file__))))
 import argparse
@@ -36,16 +37,22 @@ from src.cluster.conv_spks import (
 class BaseInferenceModel(ABC):
     """Abstract base class for all inference models"""
 
-    def __init__(self, checkpoint_path=None, cache_dir=None, beam_size=3, worker_id=0):
+    def __init__(self, checkpoint_path=None, cache_dir=None,
+                 beam_size=3,
+                 no_repeat_ngram_size=4,
+                 worker_id=0,
+                 dtype=torch.bfloat16):
         self.model = None
         self.text_transform = None
         self.av_data_collator = None
         self.beam_search = None
-        self.tokenizer = None
+        self.processor = None
         self.checkpoint_path = checkpoint_path
         self.cache_dir = cache_dir or "./model-bin"
         self.beam_size = beam_size
+        self.no_repeat_ngram_size = no_repeat_ngram_size
         self.worker_id = worker_id
+        self.dtype = dtype
 
         # bind the inference model into the gpu
         torch.cuda.set_device(self.worker_id)
@@ -56,163 +63,138 @@ class BaseInferenceModel(ABC):
         pass
 
     @abstractmethod
-    def inference(self, videos, audios, **kwargs):
+    def inference(self, inputs, **kwargs):
         """Perform inference on audio-visual data"""
         pass
 
     def get_tokenizer_paths(self):
-        """Get paths for tokenizer files"""
-        base_dir = os.path.dirname(os.path.dirname(__file__))
-        sp_model_path = os.path.join(base_dir, "src/tokenizer/spm/unigram/unigram5000.model")
-        dict_path = os.path.join(base_dir, "src/tokenizer/spm/unigram/unigram5000_units.txt")
-        return sp_model_path, dict_path
+        # """Get paths for tokenizer files"""
+        # base_dir = os.path.dirname(os.path.dirname(__file__))
+        # sp_model_path = os.path.join(base_dir, "src/tokenizer/spm/unigram/unigram5000.model")
+        # dict_path = os.path.join(base_dir, "src/tokenizer/spm/unigram/unigram5000_units.txt")
+        # return sp_model_path, dict_path
+        raise NotImplementedError
 
 
-class AVSRCocktailModel(BaseInferenceModel):
+class Qwen2AudioModel(BaseInferenceModel):
     """AVSR Cocktail model implementation"""
 
     def load_model(self):
-        from src.dataset.avhubert_dataset import AudioTransform, VideoTransform, DataCollator
-        from src.avhubert_avsr.avhubert_avsr_model import AVHubertAVSR, get_beam_search_decoder
-        from src.avhubert_avsr.configuration_avhubert_avsr import AVHubertAVSRConfig
+        from qwen2.qwen2model import create_qwen2audio_model
+        from transformers import AutoProcessor, AutoConfig
+        from src.dataset.qwen_audio_dataset import Qwen2AudioEvalCollator, WavAudioTransform
+        from peft import PeftModel, LoraModel, LoraConfig
 
         # Load text transform
-        sp_model_path, dict_path = self.get_tokenizer_paths()
-        self.text_transform = TextTransform(
-            sp_model_path=sp_model_path,
-            dict_path=dict_path,
-        )
+        model_name = "Qwen/Qwen2-Audio-7B"
+        processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
+        #
+        # # Load data collator
+        audio_transform = WavAudioTransform(subset="test")
+        # video_transform = VideoTransform(subset="test")
+        #
+        # self.av_data_collator = DataCollator(
+        #     text_transform=self.text_transform,
+        #     audio_transform=audio_transform,
+        #     video_transform=video_transform,
+        # )
+        self.av_data_collator = Qwen2AudioEvalCollator(processor,
+                                                       audio_transform=WavAudioTransform(subset="test")
+                                                       )
 
-        # Load data collator
-        audio_transform = AudioTransform(subset="test")
-        video_transform = VideoTransform(subset="test")
+        device = torch.device(f"cuda:{self.worker_id}")
+        device = device if torch.cuda.is_available() else "cpu"
 
-        self.av_data_collator = DataCollator(
-            text_transform=self.text_transform,
-            audio_transform=audio_transform,
-            video_transform=video_transform,
-        )
+        # model is created in torch.float32 might cause warnings, but trainer/autocast might handle things properly
+        torch_dtype = self.dtype
 
         # Load model
-        model_path = self.checkpoint_path or "nguyenvulebinh/AVSRCocktail"
-        print(f"Loading model from {model_path}")
-        avsr_model = AVHubertAVSR.from_pretrained(model_path, cache_dir=self.cache_dir)
+        model_path = self.checkpoint_path or "Qwen/Qwen2-Audio-7B"
+        config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        attention_type = "flash_attention_2"
+        avsr_model = create_qwen2audio_model(model_name, config,
+                                             torch_dtype=torch_dtype,
+                                             trust_remote_code=True,
+                                             low_cpu_mem_usage=True,
+                                             attn_implementation=attention_type,
+                                             mem_efficient=True,
+                                             device_map={"": device})
+
+        if (model_path != model_name):
+            avsr_model = PeftModel.from_pretrained(avsr_model, model_path)
+            avsr_model.merge_and_unload()
+
         avsr_model.eval().cuda()
-        # device = torch.device(f"cuda:{self.worker_id}")
-        self.model = avsr_model.avsr
-        self.beam_search = get_beam_search_decoder(self.model, self.text_transform.token_list, beam_size=self.beam_size)
+        self.model = avsr_model
+        self.processor = processor
 
-    def inference(self, videos, audios, **kwargs):
-        avhubert_features = self.model.encoder(
-            input_features=audios,
-            video=videos,
-        )
-        audiovisual_feat = avhubert_features.last_hidden_state
-        audiovisual_feat = audiovisual_feat.squeeze(0)
+    def inference(self, inputs, **kwargs):
+        # avhubert_features = self.model.encoder(
+        #     input_features=audios,
+        #     video=videos,
+        # )
+        # audiovisual_feat = avhubert_features.last_hidden_state
+        # audiovisual_feat = audiovisual_feat.squeeze(0)
+        #
+        # nbest_hyps = self.beam_search(audiovisual_feat)
+        # nbest_hyps = [h.asdict() for h in nbest_hyps[:min(len(nbest_hyps), 1)]]
+        # predicted_token_id = torch.tensor(list(map(int, nbest_hyps[0]["yseq"][1:])))
+        # predicted = self.text_transform.post_process(predicted_token_id).replace("<eos>", "")
 
-        nbest_hyps = self.beam_search(audiovisual_feat)
-        nbest_hyps = [h.asdict() for h in nbest_hyps[:min(len(nbest_hyps), 1)]]
-        predicted_token_id = torch.tensor(list(map(int, nbest_hyps[0]["yseq"][1:])))
-        predicted = self.text_transform.post_process(predicted_token_id).replace("<eos>", "")
-        return predicted
-
-
-class AutoAVSRModel(BaseInferenceModel):
-    """Auto AVSR model implementation"""
-
-    def load_model(self):
-        from src.dataset.av_dataset import AudioTransform, VideoTransform, DataCollator
-        from src.auto_avsr.configuration_avsr import AutoAVSRConfig
-        from src.auto_avsr.avsr_model import AutoAVSR, get_beam_search_decoder
-
-        # Load text transform
-        sp_model_path, dict_path = self.get_tokenizer_paths()
-        self.text_transform = TextTransform(
-            sp_model_path=sp_model_path,
-            dict_path=dict_path,
+        processor = self.processor
+        generated_ids = self.model.generate(
+            **inputs,
+            max_length=1024,
+            num_beams=self.beam_size,
+            no_repeat_ngram_size=self.no_repeat_ngram_size,
+            # repetition_penalty=1.2,
+            # length_penalty=0.9,
+            early_stopping=True,
+            # 🔥 Remove top_k / top_p when not sampling
+            # top_k=0,
+            # top_p=0.01,
         )
 
-        # Load data collator
-        audio_transform = AudioTransform(subset="test")
-        video_transform = VideoTransform(subset="test")
+        # Remove prompt tokens
+        prompt_lens = inputs["input_ids"].ne(processor.tokenizer.pad_token_id).sum(dim=1)
+        clean_outputs = [
+            gen_ids[prompt_len:] for gen_ids, prompt_len in zip(generated_ids, prompt_lens)
+        ]
 
-        self.av_data_collator = DataCollator(
-            text_transform=self.text_transform,
-            audio_transform=audio_transform,
-            video_transform=video_transform,
+        responses = processor.batch_decode(
+            clean_outputs,
+            skip_cspecial_tokens=True,
+            clean_up_tokenization_spaces=True
         )
 
-        # Load model    
-        avsr_config = AutoAVSRConfig()
-        avsr_model = AutoAVSR(avsr_config)
-        ckpt_path = self.checkpoint_path or "./model-bin/auto_avsr/avsr_trlrwlrs2lrs3vox2avsp_base.pth"
-        print(f"Loading model from {ckpt_path}")
-        pretrained_weights = torch.load(ckpt_path, weights_only=True)
-        avsr_model.avsr.load_state_dict(pretrained_weights)
-        avsr_model.eval().cuda()
-        self.model = avsr_model.avsr
-        self.beam_search = get_beam_search_decoder(self.model, self.text_transform.token_list, beam_size=self.beam_size)
+        def strip_known_tags(text):
 
-    def inference(self, videos, audios, **kwargs):
-        video_feat, _ = self.model.encoder(videos, None)
-        audio_feat, _ = self.model.aux_encoder(audios, None)
-        audiovisual_feat = self.model.fusion(torch.cat((video_feat, audio_feat), dim=-1))
-        audiovisual_feat = audiovisual_feat.squeeze(0)
+            for tag in ["<|en|>", "<|endoftext|>", "<|AUDIO|>", "<|audio_eos|>", "[noise]", "<|audio_bos|>"]:
+                text = text.replace(tag, "")
 
-        nbest_hyps = self.beam_search(audiovisual_feat)
-        nbest_hyps = [h.asdict() for h in nbest_hyps[:min(len(nbest_hyps), 1)]]
-        predicted_token_id = torch.tensor(list(map(int, nbest_hyps[0]["yseq"][1:])))
-        predicted = self.text_transform.post_process(predicted_token_id).replace("<eos>", "")
-        return predicted
+            text = text.strip()
 
+            if text.startswith("Transcribe this speech:"):
+                text = text[len("Transcribe this speech:"):]
 
-class MuAViCModel(BaseInferenceModel):
-    """MuAViC model implementation"""
+            def remove_bracket_tags(text):
+                # Removes [anything in square brackets], including the brackets
+                return re.sub(r'\[[^\]]*\]', '', text).strip()
 
-    def load_model(self):
-        from src.dataset.avhubert_dataset import AudioTransform, VideoTransform, DataCollator
-        from src.avhubert_muavic.avhubert2text import AV2TextForConditionalGeneration
-        from transformers import Speech2TextTokenizer
+            text = remove_bracket_tags(text)
 
-        # Load text transform
-        sp_model_path, dict_path = self.get_tokenizer_paths()
-        self.text_transform = TextTransform(
-            sp_model_path=sp_model_path,
-            dict_path=dict_path,
-        )
+            def remove_language_tags(text):
+                return re.sub(r'<\|[a-zA-Z_-]+?\|>', '', text)
 
-        # Load data collator
-        audio_transform = AudioTransform(subset="test")
-        video_transform = VideoTransform(subset="test")
+            text = remove_language_tags(text)
 
-        self.av_data_collator = DataCollator(
-            text_transform=self.text_transform,
-            audio_transform=audio_transform,
-            video_transform=video_transform,
-        )
+            return text
 
-        # Load model
-        model_name = self.checkpoint_path or 'nguyenvulebinh/AV-HuBERT-MuAViC-en'
-        print(f"Loading model from {model_name}")
-        self.model = AV2TextForConditionalGeneration.from_pretrained(
-            model_name,
-            cache_dir=self.cache_dir
-        )
-        self.tokenizer = Speech2TextTokenizer.from_pretrained(
-            model_name,
-            cache_dir=self.cache_dir
-        )
-        self.model = self.model.cuda().eval()
+        pred_transcript = [strip_known_tags(d).strip() for d in responses]
+        # predictions_lst.extend(pred_transcript)
+        # target_lst.extend(refs)
 
-    def inference(self, videos, audios, **kwargs):
-        attention_mask = torch.BoolTensor(audios.size(0), audios.size(-1)).fill_(False).cuda()
-        output = self.model.generate(
-            audios,
-            attention_mask=attention_mask,
-            video=videos,
-        )
-        output = self.tokenizer.batch_decode(output, skip_special_tokens=True)[0].upper()
-        return output
+        return pred_transcript
 
 
 class InferenceEngine:
@@ -234,17 +216,17 @@ class InferenceEngine:
         self.worker_id = worker_id
         self.model_impl = self._get_model_implementation()
 
-
     def _get_model_implementation(self) -> BaseInferenceModel:
         """Factory method to get the appropriate model implementation"""
-        if self.model_type == "avsr_cocktail":
-            return AVSRCocktailModel(self.checkpoint_path, self.cache_dir, self.beam_size, worker_id=self.worker_id)
-        elif self.model_type == "auto_avsr":
-            return AutoAVSRModel(self.checkpoint_path, self.cache_dir, self.beam_size, worker_id=self.worker_id)
-        elif self.model_type == "muavic_en":
-            return MuAViCModel(self.checkpoint_path, self.cache_dir, self.beam_size, worker_id=self.worker_id)
-        else:
-            raise ValueError(f"Unknown model type: {self.model_type}")
+        # if self.model_type == "avsr_cocktail":
+        #     return AVSRCocktailModel(self.checkpoint_path, self.cache_dir, self.beam_size, worker_id=self.worker_id)
+        # elif self.model_type == "auto_avsr":
+        #     return AutoAVSRModel(self.checkpoint_path, self.cache_dir, self.beam_size, worker_id=self.worker_id)
+        # elif self.model_type == "muavic_en":
+        #     return MuAViCModel(self.checkpoint_path, self.cache_dir, self.beam_size, worker_id=self.worker_id)
+        # else:
+        #     raise ValueError(f"Unknown model type: {self.model_type}")
+        return Qwen2AudioModel(self.checkpoint_path, self.cache_dir, self.beam_size, worker_id=self.worker_id)
 
     def load_model(self):
         """Load the selected model"""
@@ -299,14 +281,16 @@ class InferenceEngine:
         sample = {
             "video": video
         }
-        sample_features = self.model_impl.av_data_collator([sample])
-        audios = sample_features["audios"].cuda()
-        videos = sample_features["videos"].cuda()
-        audio_lengths = sample_features["audio_lengths"].cuda()
-        video_lengths = sample_features["video_lengths"].cuda()
+        inputs = self.model_impl.av_data_collator([sample])
+        for key in inputs:
+            inputs[key] = inputs[key].cuda()
+        # audios = sample_features["audios"].cuda()
+        # videos = sample_features["videos"].cuda()
+        # audio_lengths = sample_features["audio_lengths"].cuda()
+        # video_lengths = sample_features["video_lengths"].cuda()
 
         try:
-            output = self.model_impl.inference(videos, audios)
+            output = self.model_impl.inference(inputs)
         except Exception as e:
             print(f"Error during inference for segment {sample}")
             raise e
@@ -405,7 +389,6 @@ class InferenceEngine:
 
 
 def _eval_lrs2_single_worker(args, dataset, worker_id, result_queue):
-
     print(dataset, flush=True)
     engine = InferenceEngine(args.model_type, args.checkpoint_path,
                              args.cache_dir, args.beam_size, args.max_length,
@@ -417,12 +400,15 @@ def _eval_lrs2_single_worker(args, dataset, worker_id, result_queue):
 
     for sample in tqdm(dataset, desc="Processing samples", position=worker_id):
         label = str(sample['label'], encoding='utf-8')
-        label_norm = norm_string(label.replace("<unk>", ""))
+        label_norm = norm_string(label.lower().replace("<unk>", ""))
 
         video = sample['video']
 
         output = engine.infer_processed_sample(video)
-        output_norm = norm_string(output.replace("<unk>", ""))
+        output = output[0]
+        output_norm = norm_string(output.lower().replace("<unk>", ""))
+
+        # print(output_norm, label_norm)
 
         output_list.append(output_norm)
         label_list.append(label_norm)
@@ -539,7 +525,7 @@ def main():
     parser.add_argument(
         '--dataset_name',
         type=str,
-        # required=True, 
+        # required=True,
         default='lrs2',
         choices=['lrs2', 'AVCocktail'],
         help='Path to folder containing session data (supports glob patterns with *)'
@@ -549,7 +535,7 @@ def main():
     parser.add_argument(
         '--set_id',
         type=str,
-        # required=True, 
+        # required=True,
         default='*',
         choices=['test', 'test_snr_n5_interferer_1', 'test_snr_n5_interferer_2', 'test_snr_0_interferer_1',
                  'test_snr_0_interferer_2', 'test_snr_5_interferer_1', 'test_snr_5_interferer_2',
@@ -603,7 +589,6 @@ def main():
     args = parser.parse_args()
 
     # Initialize inference engine
-
 
     if args.dataset_name == 'lrs2':
         if args.set_id not in ['test', 'test_snr_n5_interferer_1', 'test_snr_n5_interferer_2',

@@ -245,7 +245,6 @@ if __name__ == "__main__":
     parser.add_argument("--attn_implementation", type=str, default="eager")
     parser.add_argument("--bf16", action="store_true", default=False)
 
-
     args = parser.parse_args()
 
     if args.attn_implementation == _FLASH_ATTN:

@@ -725,6 +725,8 @@ class AVHubertEncoder(Wav2Vec2Encoder):
 
         batch_size, seq_len, hidden_size = hidden_states.shape
 
+        assert (self._attn_implementation == "flash_attention_2"), "only FlashAttention2 is currently supported."
+
         if self._attn_implementation == "flash_attention_2" and not self.gradient_checkpointing:
 
             # TODO: prepare data for flash attention

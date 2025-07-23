@@ -60,7 +60,7 @@ class E2E(torch.nn.Module):
         #     a_upsample_ratio=args.aux_a_upsample_ratio,
         #     relu_type=getattr(args, "aux_relu_type", "swish"),
         # )
-        
+
         self.encoder = AVHubertModel(args)
         # print(self.encoder)
         # exit()
@@ -118,19 +118,19 @@ class E2E(torch.nn.Module):
 
     def forward(self, video, audio, video_lengths, audio_lengths, label):
         video_padding_mask = make_non_pad_mask(video_lengths).to(video.device)
-        # attention_mask = 
+
         avhubert_features = self.encoder(
-            input_features = audio, 
-            video = video,
-            attention_mask = video_padding_mask
+            input_features=audio,
+            video=video,
+            attention_mask=video_padding_mask
         )
-        
+
         # avhubert_features = self.encoder(
         #     input_features = audio, 
         #     video = video,
         #     attention_mask = None
         # )
-            # attention_mask: Optional[torch.Tensor] = None,
+        # attention_mask: Optional[torch.Tensor] = None,
 
         # audio_lengths = torch.div(audio_lengths, 640, rounding_mode="trunc")
         # audio_padding_mask = make_non_pad_mask(audio_lengths).to(video.device).unsqueeze(-2)
