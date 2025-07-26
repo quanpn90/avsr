@@ -101,12 +101,12 @@ class MemoryOptimizedQwen2AudioEncoderLayer(Qwen2AudioEncoderLayer):
         self._attn_implementation = config._attn_implementation
 
     def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor,
-        layer_head_mask: torch.Tensor,
-        output_attentions: bool = False,
-        flash_kwargs=None
+            self,
+            hidden_states: torch.Tensor,
+            attention_mask: torch.Tensor,
+            layer_head_mask: torch.Tensor,
+            output_attentions: bool = False,
+            flash_kwargs=None
     ) -> torch.Tensor:
         """
         Args:
@@ -161,6 +161,7 @@ class MemoryOptimizedQwen2AudioEncoderLayer(Qwen2AudioEncoderLayer):
             outputs += (attn_weights,)
 
         return outputs
+
 
 class MemoryOptimizedQwen2AudioEncoder(Qwen2AudioEncoder):
     """

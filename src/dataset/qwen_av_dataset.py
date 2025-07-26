@@ -15,7 +15,6 @@ from src.dataset.avhubert_dataset import FBanksAndStack, collate_pad, VideoTrans
 
 from src.dataset.qwen_audio_dataset import normalize_transcript, WavAudioTransform
 
-
 QWEN2_LANG_TO_TOKEN = {
 
     "en": "<|en|>",
@@ -30,10 +29,6 @@ QWEN2_LANG_TO_TOKEN = {
 }
 
 LANG_TOKENS = set(QWEN2_LANG_TO_TOKEN.values())
-
-
-
-
 
 
 @dataclass
@@ -52,25 +47,28 @@ class Qwen2AVDataCollator:
     spec_freq_masking = T.FrequencyMasking(freq_mask_param=30)
     rate_ratio: int = 640
 
+    eos_token = "<|endoftext|>"
+    eos_token_id = 151643
+    audio_eos_token_id = 151648
+
     def __init__(self, processor,
-                 prompt_template="<|video_bos|><|VIDEO|><|video_eos|> <|audio_bos|><|AUDIO|><|audio_eos|> Transcribe this speech:",
-                 eos_token="<|endoftext|>",
-                 eos_token_id=151643,
-                 audio_eos_token_id=151648,
+                 prompt_template="<|video_bos|><|VIDEO|><|video_eos|><|audio_bos|><|AUDIO|><|audio_eos|>Transcribe this speech:",
                  video_transform=None,
                  audio_transform=None,
                  wav_augment=False,
                  spec_augment=False,
-                 include_text=False):
+                 include_text=False,
+                 version=2.0):
         self.processor = processor
         self.prompt_template = prompt_template
-        self.eos_token = eos_token
-        self.eos_token_id = eos_token_id
-        self.audio_eos_token_id = audio_eos_token_id
+        # self.eos_token_id = eos_token_id
+        # self.audio_eos_token_id = audio_eos_token_id
 
         self.prompt_len = len(self.processor.tokenizer(self.prompt_template)["input_ids"])
 
         self.lang_ids = {token: processor.tokenizer.convert_tokens_to_ids(token) for token in LANG_TOKENS}
+
+        print(self.lang_ids)
 
         self.do_wav_augment = wav_augment
         self.do_spec_augment = spec_augment
@@ -79,6 +77,8 @@ class Qwen2AVDataCollator:
         self.audio_transform = audio_transform
         self.video_transform = video_transform
         self.fbank_and_stack = FBanksAndStack()
+
+        self.version = version
 
     def __call__(self, features: List[Dict[str, Union[List[int], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
 
@@ -171,7 +171,7 @@ class Qwen2AVDataCollator:
 
         # process inputs for avhubert
         avhubert_inputs = collate_pad(samples)
-        
+
         inputs["videos"] = avhubert_inputs["videos"].permute(0, 2, 1, 3, 4)
         inputs["audios"] = avhubert_inputs["audios"].permute(0, 2, 1)
         inputs["video_lengths"] = avhubert_inputs["video_lengths"]
@@ -181,8 +181,11 @@ class Qwen2AVDataCollator:
 
     def _concat_prompt(self, target_text, language_token):
         # add space between or not add space between?
-        return f"{self.prompt_template} {language_token} {target_text} {self.eos_token}"
 
+        if self.version == 2.0:
+            return f"{self.prompt_template}{language_token}{target_text}{self.eos_token}"
+        else:
+            return f"{self.prompt_template} {language_token} {target_text} {self.eos_token}"
 
 # class Qwen2AVEvalCollator(Qwen2AVDataCollator):
 #
@@ -236,4 +239,3 @@ class Qwen2AVDataCollator:
 #     def _get_prompt(self, language_token):
 #         # add space between or not add space between?
 #         return f"{self.prompt_template} {language_token}"
-

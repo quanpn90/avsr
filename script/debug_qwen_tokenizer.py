@@ -37,7 +37,7 @@ for token in ["<|AUDIO|>", "<|audio_bos|>", "<|audio_eos|>", "<|VIDEO|>", "<|vid
 
 import datasets
 
-cache_dir = "/hkfs/work/workspace/scratch/pj5699-bayesian_speechlm/avsr/lsr_vox_cocktail/data-bin/cache/"
+cache_dir = "data-bin/cache/"
 test_dataset = datasets.load_dataset("nguyenvulebinh/AVYT", "lrs2", streaming=True,
                                      cache_dir=cache_dir).remove_columns(['__key__', '__url__'])['train']
 
@@ -45,21 +45,21 @@ sample = next(iter(test_dataset))
 
 video_array = sample['video']
 text = sample["label"].decode(encoding="utf-8")
-
-print(text)
-
 audio = load_audio(video_array).squeeze().numpy()
 video = load_video(video_array)
 
-prompt_template = "<|video_bos|><|VIDEO|><|video_eos|> <|audio_bos|><|AUDIO|><|audio_eos|> Transcribe this speech:"
+prompt_template = "<|video_bos|><|VIDEO|><|video_eos|><|audio_bos|><|AUDIO|><|audio_eos|>Transcribe this speech:"
 text = prompt_template + text.lower()
 
 inputs = new_processor(text, audio, video)
 
+# print(inputs.keys())
+print(inputs["input_ids"])
+
 print("testing successfully!!")
 
-processor_path = "/hkfs/work/workspace/scratch/pj5699-bayesian_speechlm/avsr/lsr_vox_cocktail/" + "av_tokenizer"
-new_processor.save_pretrained(processor_path)
+# processor_path = "/hkfs/work/workspace/scratch/pj5699-bayesian_speechlm/avsr/lsr_vox_cocktail/" + "av_tokenizer"
+# new_processor.save_pretrained(processor_path)
 
 # running script
 # PYTHONPATH=$HOME/avsr/ python debug_qwen_tokenizer.py

@@ -1,8 +1,28 @@
 import os
 import sys
+import logging
+import torch
+
+world_size = int(os.environ.get("WORLD_SIZE", 1))
+local_rank = int(os.environ.get("LOCAL_RANK", 0))
+device = torch.device(f"cuda:{local_rank}")
+
+
+def is_main_process():
+    return int(os.environ.get("RANK", "0")) == 0
+
+
+if not is_main_process():
+    logging.basicConfig(level=logging.ERROR)
+    # Also set loggers for popular libs
+    for name in ['transformers', 'datasets', 'torch', 'accelerate']:
+        logging.getLogger(name).setLevel(logging.ERROR)
+
+if not is_main_process():
+    sys.stdout = open(os.devnull, "w")
 
 os.sys.path.append(os.path.join(os.path.dirname(os.path.dirname(__file__))))
-import torch
+
 from datasets import load_from_disk
 from src.dataset.avhubert_dataset import load_audio, load_video, cut_or_pad, AudioTransform, VideoTransform, \
     DataCollator
@@ -31,11 +51,6 @@ if os.environ.get("QWENAV") is None:
 else:
     qwenav_base = os.environ["QWENAV"]
 
-world_size = int(os.environ.get("WORLD_SIZE", 1))
-local_rank = int(os.environ.get("LOCAL_RANK", 0))
-device = torch.device(f"cuda:{local_rank}")
-
-import logging
 from transformers import modeling_utils
 
 _FLASH_ATTN = "flash_attention_2"
@@ -46,42 +61,6 @@ def skip_check_and_enable_flash_attn_2(cls, config, **kwargs):
     # TODO: add option to switch
     # config._attn_implementation = "eager"
     config._attn_implementation = _FLASH_ATTN
-
-
-def is_main_process():
-    return int(os.environ.get("RANK", "0")) == 0
-
-
-if not is_main_process():
-    logging.basicConfig(level=logging.ERROR)
-    # Also set loggers for popular libs
-    for name in ['transformers', 'datasets', 'torch', 'accelerate']:
-        logging.getLogger(name).setLevel(logging.ERROR)
-
-if not is_main_process():
-    sys.stdout = open(os.devnull, "w")
-
-
-
-def skip_check_and_enable_flash_attn_2(cls, config, **kwargs):
-    # TODO: add option to switch
-    # config._attn_implementation = "eager"
-    config._attn_implementation = _FLASH_ATTN
-
-
-def is_main_process():
-    return int(os.environ.get("RANK", "0")) == 0
-
-
-if not is_main_process():
-    logging.basicConfig(level=logging.ERROR)
-    # Also set loggers for popular libs
-    for name in ['transformers', 'datasets', 'torch', 'accelerate']:
-        logging.getLogger(name).setLevel(logging.ERROR)
-
-if not is_main_process():
-    sys.stdout = open(os.devnull, "w")
-    # sys.stderr = open(os.devnull, "w")
 
 
 # NCCL_DEBUG=WARN OMP_NUM_THREADS=1 CUDA_VISIBLE_DEVICES=4,5 torchrun --nproc_per_node 2 script/train.py \
@@ -100,7 +79,7 @@ if not is_main_process():
 # --output_dir ./model-bin
 
 
-def load_avsr_dataset(cache_dir='data/new_datasets/cache/', include_mcorec=False, streaming=False):
+def load_avsr_dataset(cache_dir='./data-bin/cache/', include_mcorec=False, streaming=False):
     # streaming=True to avoid downloading all dataset at once, but it can be crash if network is unstable
     # streaming=False to download all dataset at once, it take time and around 1.5TB disk space. More stable.
 
@@ -267,6 +246,14 @@ if __name__ == "__main__":
     parser.add_argument("--cache_dir", type=str,
                         default="data-bin/cache")  # Or None to train from scratch
 
+    parser.add_argument("--finetune_avhubert", action="store_true", default=False)
+    parser.add_argument("--finetune_qwen2audio", action="store_true", default=False)
+    parser.add_argument("--whisper_encoder_mask_prob", type=float, default=0.5)
+    parser.add_argument("--avhubert_audio_mask_prob", type=float, default=0.5)
+    parser.add_argument("--label_smoothing", type=float, default=0.0)
+
+    parser.add_argument("--qwenav_version", type=float, default=2.0)
+
     args = parser.parse_args()
 
     if args.attn_implementation == _FLASH_ATTN:
@@ -290,22 +277,13 @@ if __name__ == "__main__":
     # cache_dir = "data/new_datasets/cache/"
     cache_dir = args.cache_dir
 
+    print(model_name_or_path)
+
     # Create output directory if it doesn't exist
     if not os.path.exists(output_dir):
         os.makedirs(output_dir, exist_ok=True)
 
-    # Load text transform
-    sp_model_path = os.path.join(os.path.dirname(os.path.dirname(__file__)),
-                                 "src/tokenizer/spm/unigram/unigram5000.model")
-    dict_path = os.path.join(os.path.dirname(os.path.dirname(__file__)),
-                             "src/tokenizer/spm/unigram/unigram5000_units.txt")
-    text_transform = TextTransform(
-        sp_model_path=sp_model_path,
-        dict_path=dict_path,
-    )
-
     if args.model_type == "qwen2audio":
-        # # TODO; qwen2av
         from qwen2.qwen2model import create_qwen2audio_model
         from transformers import AutoProcessor, AutoConfig
         from src.dataset.qwen_audio_dataset import Qwen2AudioDataCollator, WavAudioTransform
@@ -333,6 +311,7 @@ if __name__ == "__main__":
         else:
             # Load from scratch
             print("Loading model from scratch")
+
             avsr_model = create_qwen2audio_model(model_name, config,
                                                  torch_dtype=torch_dtype,
                                                  trust_remote_code=True,
@@ -366,13 +345,107 @@ if __name__ == "__main__":
                                                         audio_transform=WavAudioTransform(subset="test")
                                                         )
 
+    elif args.model_type == "llama3_av":
+
+        llama3av_base = "llama3av-base"
+        from llama3.llama3avmodel import LLama3AVConfig, MemoryEfficientLLama3AVLM
+        from llama3.llama3avmodel import create_llama3av_model
+
+        from transformers import AutoProcessor, AutoConfig
+
+        # llama and qwen probably can share the same data collator
+        from src.dataset.qwen_av_dataset import WavAudioTransform
+        from src.dataset.llama_av_dataset import LLama3AVDataCollator
+        from llama3.av_processor import Llama3AVProcessor
+
+        torch_dtype = torch.bfloat16 if args.bf16 else torch.float32
+        device = device if torch.cuda.is_available() else "cpu"
+        attention_type = "flash_attention_2"
+
+        # avhubert_config = AVHubertAVSRConfig(odim=qwen2audio_config.vocab_size,
+        #                                      attn_implementation=attention_type)
+        #
+        # # Create config for Full model
+        # config = Qwen2AudioVideoConfig(qwen2audio_config=qwen2audio_config,
+        #                                avhubert_config=avhubert_config,
+        #                                finetune_qwen2audio=args.finetune_qwen2audio,
+        #                                finetune_avhubert=args.finetune_avhubert)
+        config = LLama3AVConfig.from_pretrained(llama3av_base)
+
+        load_checkpoint = (model_name_or_path is not None and os.path.exists(model_name_or_path))
+        if model_name_or_path:
+            avsr_model = create_llama3av_model(model_name_or_path, config,
+                                               torch_dtype=torch_dtype,
+                                               attn_implementation=attention_type, device_map={"": device},
+                                               create_if_missing=False)
+        else:
+            model_name_or_path = llama3av_base
+            print("Loading model from scratch")
+            avsr_model = create_llama3av_model(model_name_or_path, config,
+                                               torch_dtype=torch_dtype,
+                                               attn_implementation=attention_type, device_map={"": device},
+                                               create_if_missing=True)
+
+        avsr_model.set_audio_mask(args)
+        avsr_model.label_smoothing = args.label_smoothing
+
+        # if we don't load the checkpoint: load pretrained weights
+        # if not load_checkpoint:
+        #     avsr_model.load_pretrained_avhubert(cache_dir=cache_dir)
+        #     avsr_model.load_pretrained_qwen2audio(model_name=qwenav_base,
+        #                                           cache_dir=cache_dir)
+
+        processor = Llama3AVProcessor.from_pretrained(llama3av_base, trust_remote_code=True)
+        processor.tokenizer.pad_token = processor.tokenizer.eos_token
+
+        # ######### LORA ###################
+        ## TODO: more option to control which weights to fine tune
+        lora_target_modules = ["q_proj", "v_proj"]
+        # lora_target_modules = "all-linear"
+
+        lora_config = LoraConfig(r=16, lora_alpha=64,
+                                 target_modules=lora_target_modules, lora_dropout=0.05,
+                                 bias="none")
+
+        avsr_model.language_model.add_adapter(lora_config)
+        avsr_model.audio_tower.add_adapter(lora_config)
+
+        module = avsr_model.video_feature_projector
+        for param in module.parameters():
+            param.requires_grad = True
+
+        if args.finetune_avhubert:
+            module = avsr_model.avhubert_encoder
+            for param in module.parameters():
+                param.requires_grad = True
+
+        ######### DATASET ################
+
+        # Load dataset
+        train_dataset, valid_dataset, interference_dataset = load_avsr_dataset(streaming=streaming_dataset,
+                                                                               include_mcorec=include_mcorec,
+                                                                               cache_dir=cache_dir)
+
+        prompt_template = "<|video_bos|><|VIDEO|><|video_eos|><|audio_bos|><|AUDIO|><|audio_eos|>Transcribe this speech:"
+        train_av_data_collator = LLama3AVDataCollator(processor,
+                                                      prompt_template=prompt_template,
+                                                      video_transform=VideoTransform(subset="train"),
+                                                      audio_transform=WavAudioTransform(subset="train",
+                                                                                        speech_dataset=interference_dataset),
+                                                      )
+        valid_av_data_collator = LLama3AVDataCollator(processor,
+                                                      prompt_template=prompt_template,
+                                                      video_transform=VideoTransform(subset="train"),
+                                                      audio_transform=WavAudioTransform(subset="test")
+                                                      )
+
     elif args.model_type == "qwen2av":
         # # TODO; qwen2av
         from qwen2.qwen2avconfig import Qwen2AudioVideoConfig, Qwen2AudioConfig
         from qwen2.qwen2avmodel import create_qwen2av_model
 
         from transformers import AutoProcessor, AutoConfig
-        from src.dataset.qwen_av_dataset import Qwen2AVDataCollator, WavAudioTransform
+        from src.dataset.qwen_av_dataset import WavAudioTransform, Qwen2AVDataCollator
         from qwen2.av_processor import Qwen2AudioVideoProcessor
 
         qwen2audio_config = Qwen2AudioConfig.from_pretrained(qwenav_base)
@@ -383,13 +456,28 @@ if __name__ == "__main__":
         avhubert_config = AVHubertAVSRConfig(odim=qwen2audio_config.vocab_size,
                                              attn_implementation=attention_type)
 
+        # Create config for Full model
         config = Qwen2AudioVideoConfig(qwen2audio_config=qwen2audio_config,
-                                       avhubert_config=avhubert_config)
+                                       avhubert_config=avhubert_config,
+                                       finetune_qwen2audio=args.finetune_qwen2audio,
+                                       finetune_avhubert=args.finetune_avhubert)
 
         load_checkpoint = (model_name_or_path is not None and os.path.exists(model_name_or_path))
-        avsr_model = create_qwen2av_model(model_name_or_path, config,
-                                          torch_dtype=torch_dtype, load=load_checkpoint,
-                                          attn_implementation=attention_type, device_map={"": device})
+        if model_name_or_path:
+            avsr_model = create_qwen2av_model(model_name_or_path, config,
+                                              torch_dtype=torch_dtype,
+                                              attn_implementation=attention_type, device_map={"": device},
+                                              create_if_missing=False)
+        else:
+            model_name_or_path = "./qwenav-prototype"
+            print("Loading model from scratch")
+            avsr_model = create_qwen2av_model(model_name_or_path, config,
+                                              torch_dtype=torch_dtype,
+                                              attn_implementation=attention_type, device_map={"": device},
+                                              create_if_missing=True)
+
+        avsr_model.set_audio_mask(args)
+        avsr_model.label_smoothing = args.label_smoothing
 
         # if we don't load the checkpoint: load pretrained weights
         if not load_checkpoint:
@@ -408,7 +496,17 @@ if __name__ == "__main__":
                                  target_modules=lora_target_modules, lora_dropout=0.05,
                                  bias="none")
 
-        avsr_model.add_adapter(lora_config)
+        avsr_model.language_model.add_adapter(lora_config)
+        avsr_model.audio_tower.add_adapter(lora_config)
+
+        module = avsr_model.video_feature_projector
+        for param in module.parameters():
+            param.requires_grad = True
+
+        if args.finetune_avhubert:
+            module = avsr_model.avhubert_encoder
+            for param in module.parameters():
+                param.requires_grad = True
 
         ######### DATASET ################
 
@@ -416,110 +514,68 @@ if __name__ == "__main__":
         train_dataset, valid_dataset, interference_dataset = load_avsr_dataset(streaming=streaming_dataset,
                                                                                include_mcorec=include_mcorec,
                                                                                cache_dir=cache_dir)
-        prompt_template = "<|video_bos|><|VIDEO|><|video_eos|> <|audio_bos|><|AUDIO|><|audio_eos|> Transcribe this speech:",
+        prompt_template = "<|video_bos|><|VIDEO|><|video_eos|><|audio_bos|><|AUDIO|><|audio_eos|>Transcribe this speech:"
         train_av_data_collator = Qwen2AVDataCollator(processor,
                                                      prompt_template=prompt_template,
                                                      video_transform=VideoTransform(subset="train"),
                                                      audio_transform=WavAudioTransform(subset="train",
                                                                                        speech_dataset=interference_dataset),
+                                                     version=args.qwenav_version
                                                      )
         valid_av_data_collator = Qwen2AVDataCollator(processor,
                                                      prompt_template=prompt_template,
                                                      video_transform=VideoTransform(subset="train"),
-                                                     audio_transform=WavAudioTransform(subset="test")
+                                                     audio_transform=WavAudioTransform(subset="test"),
+                                                     version=args.qwenav_version
                                                      )
 
     print("train_dataset\n", train_dataset)
     print("valid_dataset\n", valid_dataset)
     summary(avsr_model)
 
-    if args.model_type == "avhubert":
-        training_args = TrainingArguments(
-            output_dir=output_dir,
-            logging_dir=os.path.join(output_dir, "log"),
-            # group_by_length=True,
-            # length_column_name='length',
-            label_names=["labels"],
-            per_device_train_batch_size=batch_size,
-            per_device_eval_batch_size=batch_size,
-            # auto_find_batch_size = True,
-            # max_grad_norm=0.1,
-            eval_strategy=IntervalStrategy.STEPS,
-            save_strategy=IntervalStrategy.STEPS,
-            max_steps=max_steps,
-            gradient_accumulation_steps=gradient_accumulation_steps,
-            metric_for_best_model='loss',
-            greater_is_better=False,
-            fp16=not args.bf16,
-            bf16=args.bf16,
-            gradient_checkpointing=False,
-            remove_unused_columns=False,
-            dataloader_num_workers=10,
-            # save_only_model=True, # WARNING: this will save only model and not optimizer, scheduler, etc.
-            save_steps=save_steps,
-            eval_steps=eval_steps,
-            logging_steps=log_interval,
-            learning_rate=learning_rate,
-            weight_decay=0.005,
-            warmup_steps=warmup_steps,
-            save_total_limit=500,
-            ignore_data_skip=True,
-            dataloader_drop_last=True,
-            dataloader_pin_memory=True,
-            # save_safetensors=False,
-            report_to=report_to,  # enable logging to W&B,
-            # report_to="none",
-            run_name=checkpoint_name,  # name of the W&B run (optional)
-            accelerator_config={
-                "dispatch_batches": False
-            }
-            # dispatch_batches=False
-            # ddp_find_unused_parameters=True
-        )
-    else:
-        training_args = TrainingArguments(
-            output_dir=output_dir,
-            logging_dir=os.path.join(output_dir, "log"),
-            # group_by_length=True,
-            # length_column_name='length',
-            label_names=["labels"],
-            per_device_train_batch_size=batch_size,
-            per_device_eval_batch_size=batch_size,
-            # auto_find_batch_size = True,
-            # max_grad_norm=0.1,
-            eval_strategy=IntervalStrategy.STEPS,
-            save_strategy=IntervalStrategy.STEPS,
-            max_steps=max_steps,
-            gradient_accumulation_steps=gradient_accumulation_steps,
-            metric_for_best_model='loss',
-            greater_is_better=False,
-            fp16=not args.bf16,
-            bf16=args.bf16,
-            gradient_checkpointing=False,
-            remove_unused_columns=False,
-            dataloader_num_workers=8,
-            # save_only_model=True, # WARNING: this will save only model and not optimizer, scheduler, etc.
-            save_steps=save_steps,
-            eval_steps=eval_steps,
-            logging_steps=log_interval,
-            learning_rate=learning_rate,
-            weight_decay=0.005,
-            warmup_steps=warmup_steps,
-            save_total_limit=500,
-            # ignore_data_skip=True,
-            dataloader_drop_last=True,
-            dataloader_pin_memory=True,
-            # save_safetensors=False,
-            report_to=report_to,  # enable logging to W&B,
-            # report_to="none",
-            run_name=checkpoint_name,  # name of the W&B run (optional)
-            accelerator_config={
-                "dispatch_batches": False
-            },
-            disable_tqdm=args.no_progress_bar,
-            # dispatch_batches=False
-            ddp_find_unused_parameters=False
-        )
+    training_args = TrainingArguments(
+        output_dir=output_dir,
+        logging_dir=os.path.join(output_dir, "log"),
+        # group_by_length=True,
+        # length_column_name='length',
+        label_names=["labels"],
+        per_device_train_batch_size=batch_size,
+        per_device_eval_batch_size=batch_size,
+        # auto_find_batch_size = True,
+        # max_grad_norm=0.1,
+        eval_strategy=IntervalStrategy.STEPS,
+        save_strategy=IntervalStrategy.STEPS,
+        max_steps=max_steps,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        metric_for_best_model='loss',
+        greater_is_better=False,
+        fp16=not args.bf16,
+        bf16=args.bf16,
+        gradient_checkpointing=False,
+        remove_unused_columns=False,
+        dataloader_num_workers=8,
+        # save_only_model=True, # WARNING: this will save only model and not optimizer, scheduler, etc.
+        save_steps=save_steps,
+        eval_steps=eval_steps,
+        logging_steps=log_interval,
+        learning_rate=learning_rate,
+        weight_decay=0.005,
+        warmup_steps=warmup_steps,
+        save_total_limit=10,
+        # ignore_data_skip=True,
+        dataloader_drop_last=True,
+        dataloader_pin_memory=True,
+        save_safetensors=True,
+        report_to=report_to,  # enable logging to W&B,
+        # report_to="none",
+        run_name=checkpoint_name,  # name of the W&B run (optional)
+        accelerator_config={
+            "dispatch_batches": False
+        },
+        disable_tqdm=args.no_progress_bar,
+        # dispatch_batches=False
+        ddp_find_unused_parameters=True
+    )
 
     trainer = AVSRTrainer(
         model=avsr_model,

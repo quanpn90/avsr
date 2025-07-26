@@ -5,44 +5,175 @@ import torch.nn as nn
 from typing import Optional, Tuple, Union, Dict
 from transformers.cache_utils import Cache
 from transformers import Qwen2AudioForConditionalGeneration
+from transformers.modeling_outputs import (
+    BaseModelOutputWithPast,
+    CausalLMOutputWithPast,
+    QuestionAnsweringModelOutput,
+    SequenceClassifierOutputWithPast,
+    TokenClassifierOutput,
+)
 
 from contextlib import nullcontext
 
-from qwen2.qwen2model import (MemoryEfficientQwen2AudioLM, Qwen2AudioConfig, Qwen2AudioCausalLMOutputWithPast,
-                              BayesianQwen2AudioCausalLMOutputWithPast, fast_xentropy, softmax_xentropy)
+from qwen2.qwen2model import (MemoryEfficientQwen2AudioLM, MemoryOptimizedQwen2AudioEncoder,
+                              Qwen2AudioConfig, Qwen2AudioCausalLMOutputWithPast,
+                              BayesianQwen2AudioCausalLMOutputWithPast,
+                              fast_xentropy, softmax_xentropy)
 from src.nets.backend.backbones.avhubert import AVHubertModel
 from src.avhubert_avsr.configuration_avhubert_avsr import AVHubertAVSRConfig
 from src.nets.backend.nets_utils import make_non_pad_mask
 
-from qwen2.qwen2avconfig import Qwen2AudioVideoConfig
-from transformers import AutoModel
+from llama3.llama3avconfig import LLama3AVConfig
+from transformers import AutoModel, PreTrainedModel, LlamaForCausalLM
+from transformers.models.whisper.modeling_whisper import WhisperModel
+from transformers.models.llama.modeling_llama import LlamaRMSNorm, LlamaMLP
 
 from transformers.utils import logging
+
+from qwen2.qwen2model import fast_layer_norm_cuda, fast_rms_norm_cuda, fast_xentropy, swiglu_mlp_cuda
+from optimized.apex_norm import FusedRMSNorm
+from optimized.layer_norm import MemoryEfficientLayerNorm
+from optimized.swiglu_mlp import SwiGLU_mlp, copy_weight
 
 logger = logging.get_logger(__name__)
 
 
-class MemoryEfficientQwen2AVLM(MemoryEfficientQwen2AudioLM):
-    config_class = Qwen2AudioVideoConfig
+class LLama3AVPreTrainedModel(PreTrainedModel):
+    config_class = LLama3AVConfig
+    base_model_prefix = "model"
+    supports_gradient_checkpointing = True
+    _no_split_modules = ["WhisperAttention"]
+    _skip_keys_device_placement = "past_key_values"
+    _supports_flash_attn_2 = True
+    _supports_sdpa = True
 
-    def __init__(self, config: Qwen2AudioVideoConfig):
-        # first we create audio encoder and language model
-        super().__init__(config.qwen2audio_config)
+    freeze_audio_encoder = False
+    freeze_av_encoder = False
+    label_smoothing = 0.0
+
+    def _init_weights(self, module):
+        # important: this ported version of Qwen2Audio isn't meant for training from scratch - only
+        # inference and fine-tuning - so the proper init weights code has been removed
+        std = (
+            self.config.initializer_range
+            if hasattr(self.config, "initializer_range")
+            else self.config.audio_config.initializer_range
+        )
+
+        if isinstance(module, (nn.Linear, nn.Conv1d)):
+            module.weight.data.normal_(mean=0.0, std=std)
+            if module.bias is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, nn.Embedding):
+            module.weight.data.normal_(mean=0.0, std=std)
+            if module.padding_idx is not None:
+                module.weight.data[module.padding_idx].zero_()
+
+
+class Llama3AVAudioProjector(nn.Module):
+    def __init__(self, config: LLama3AVConfig):
+        super().__init__()
+        self.linear = nn.Linear(config.audio_config.d_model,
+                                config.text_config.hidden_size, bias=True)
+
+    def forward(self, audio_features):
+        hidden_states = self.linear(audio_features)
+        return hidden_states
+
+
+class MemoryEfficientLLama3AVLM(LLama3AVPreTrainedModel):
+    config_class = LLama3AVConfig
+
+    def __init__(self, config: LLama3AVConfig):
+        super().__init__(config)
         self.config = config
 
-        # next we create avhubert encoder
-        # always drop audio, video is never dropped
+        # Whisper
+        self.audio_tower = MemoryOptimizedQwen2AudioEncoder(config.audio_config)
+        self.multi_modal_projector = Llama3AVAudioProjector(config)
+
+        # Llama Config
+        self.vocab_size = config.text_config.vocab_size
+        self.language_model = LlamaForCausalLM(config.text_config)
+        if self.language_model._tied_weights_keys is not None:
+            self._tied_weights_keys = [f"language_model.{k}" for k in self.language_model._tied_weights_keys]
+
         config.avhubert_config.audio_dropout = 1.0
         config.avhubert_config.modality_dropout = config.avhubert_audio_mask_prob
         self.avhubert_encoder = AVHubertModel(config.avhubert_config)
-        self.freeze_av_encoder = False
 
         # finally create the link between avencoder and language model
         video_embed_size = self.avhubert_encoder.encoder_embed_dim
 
         self.video_feature_projector = nn.Linear(video_embed_size,
-                                                 self.config.qwen2audio_config.text_config.hidden_size,
+                                                 self.config.text_config.hidden_size,
                                                  bias=True)
+
+        self.pad_token_id = self.config.pad_token_id if self.config.pad_token_id is not None else -1
+        self._padding_side = "left"  # set it to left by default, user can use setter to change padding_sides
+        self.post_init()
+
+        # new options for continual learning / batch_ensembles learning
+        # self.teacher = None
+        # self.teacher_distillation = 0
+        # self.label_smoothing = 0
+        # self.kl_scale = 0.
+        # self.kl_type = "kl_div"
+
+    def load_pretrained_avhubert(self,
+                                 encoder_pretrained_checkpoint="nguyenvulebinh/avhubert_encoder_large_noise_pt_noise_ft_433h",
+                                 cache_dir="model-bin/cache"):
+        print("Loading pretrained encoder from", encoder_pretrained_checkpoint)
+        encoder_pretrained = self.avhubert_encoder.from_pretrained(
+            encoder_pretrained_checkpoint,
+            cache_dir=cache_dir,
+        )
+
+        self.avhubert_encoder.load_state_dict(encoder_pretrained.state_dict())
+
+    def load_pretrained_qwen2audio(self,
+                                   model_name="openai/whisper-large-v3",
+                                   cache_dir="model-bin/cache"):
+
+        pretrained_whisper = WhisperModel.from_pretrained(model_name, cache_dir=cache_dir)
+
+        self.audio_tower.load_state_dict(pretrained_whisper.encoder.state_dict())
+
+    def load_pretrained_llama(self,
+                              model_name="llama-extended",
+                              cache_dir="model-bin/cache"):
+
+        pretrained_llama = LlamaForCausalLM.from_pretrained(model_name, cache_dir=cache_dir)
+
+        self.language_model.load_state_dict(pretrained_llama.state_dict())
+
+    @property
+    def padding_side(self):
+        return self._padding_side
+
+    @padding_side.setter
+    def padding_side(self, padding_side: str):
+        if padding_side not in ["left", "right"]:
+            raise ValueError(f"{padding_side} is not `left` or `right`.")
+        self._padding_side = padding_side
+
+    def get_input_embeddings(self):
+        return self.language_model.get_input_embeddings()
+
+    def set_input_embeddings(self, value):
+        self.language_model.set_input_embeddings(value)
+
+    def get_output_embeddings(self):
+        return self.language_model.get_output_embeddings()
+
+    def set_output_embeddings(self, new_embeddings):
+        self.language_model.set_output_embeddings(new_embeddings)
+
+    def set_decoder(self, decoder):
+        self.language_model.set_decoder(decoder)
+
+    def get_decoder(self):
+        return self.language_model.get_decoder()
 
     def set_audio_mask(self, args):
 
@@ -57,26 +188,47 @@ class MemoryEfficientQwen2AVLM(MemoryEfficientQwen2AudioLM):
         self.whisper_encoder_mask_prob = args.whisper_encoder_mask_prob
         self.avhubert_encoder_mask_prob = args.avhubert_audio_mask_prob
 
-    def load_pretrained_avhubert(self,
-                                 encoder_pretrained_checkpoint="nguyenvulebinh/avhubert_encoder_large_noise_pt_noise_ft_433h",
-                                 cache_dir="model-bin/cache"):
-        print("Loading pretrained encoder from", encoder_pretrained_checkpoint)
-        encoder_pretrained = self.avhubert_encoder.from_pretrained(
-            encoder_pretrained_checkpoint,
-            cache_dir=cache_dir,
+    def forward_lm(self, attention_mask, position_ids, past_key_values,
+                   inputs_embeds, use_cache, output_attentions, output_hidden_states, return_dict):
+
+        # outputs = self.language_model(
+        #     attention_mask=attention_mask,
+        #     position_ids=position_ids,
+        #     past_key_values=past_key_values,
+        #     inputs_embeds=inputs_embeds,
+        #     use_cache=use_cache,
+        #     output_attentions=output_attentions,
+        #     output_hidden_states=output_hidden_states,
+        #     return_dict=return_dict,
+        # )
+
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
 
-        self.avhubert_encoder.load_state_dict(encoder_pretrained.state_dict())
+        # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
+        outputs: BaseModelOutputWithPast = self.language_model.model(
+            input_ids=None,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            cache_position=None
+        )
 
-    def load_pretrained_qwen2audio(self,
-                                   model_name="Qwen/Qwen2-Audio-7B",
-                                   cache_dir="model-bin/cache"):
+        hidden_states = outputs.last_hidden_state
 
-        pretrained_qwen2audio = Qwen2AudioForConditionalGeneration.from_pretrained(model_name, cache_dir=cache_dir)
-
-        self.audio_tower.load_state_dict(pretrained_qwen2audio.audio_tower.state_dict())
-        self.language_model.load_state_dict(pretrained_qwen2audio.language_model.state_dict())
-        self.multi_modal_projector.load_state_dict(pretrained_qwen2audio.multi_modal_projector.state_dict())
+        return CausalLMOutputWithPast(
+            loss=None,
+            logits=hidden_states,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
 
     def forward(
             self,
@@ -199,12 +351,13 @@ class MemoryEfficientQwen2AVLM(MemoryEfficientQwen2AudioLM):
                     legacy_processing = (audio_tokens[:, :-1] & audio_tokens[:, 1:]).sum() == 0
 
                     if legacy_processing:
-                        logger.warning_once(
-                            "Expanding inputs for audio tokens in Qwen2Audio should be done in processing."
-                        )
-                        inputs_embeds, attention_mask, labels, position_ids, _ = self._merge_input_ids_with_audio_features(
-                            audio_features, audio_output_lengths, inputs_embeds, input_ids, attention_mask, labels
-                        )
+                        # logger.warning_once(
+                        #     "Expanding inputs for audio tokens in Qwen2Audio should be done in processing."
+                        # )
+                        # inputs_embeds, attention_mask, labels, position_ids, _ = self._merge_input_ids_with_audio_features(
+                        #     audio_features, audio_output_lengths, inputs_embeds, input_ids, attention_mask, labels
+                        # )
+                        raise NotImplementedError("legacy processing is not supported")
                     else:
                         num_audios, max_audio_tokens, embed_dim = audio_features.shape
                         audio_features_mask = torch.arange(max_audio_tokens, device=audio_output_lengths.device)[None,
@@ -244,32 +397,6 @@ class MemoryEfficientQwen2AVLM(MemoryEfficientQwen2AudioLM):
 
                     selected_video_feature = avhubert_features.last_hidden_state
 
-                    # audio_feat_lengths, audio_output_lengths = self.audio_tower._get_feat_extract_output_lengths(
-                    #     feature_attention_mask.sum(-1)
-                    # )
-                    # batch_size, _, max_mel_seq_len = input_features.shape
-                    # max_seq_len = (max_mel_seq_len - 2) // 2 + 1
-                    # # Create a sequence tensor of shape (batch_size, max_seq_len)
-                    # seq_range = (
-                    #     torch.arange(0, max_seq_len, dtype=audio_feat_lengths.dtype, device=audio_feat_lengths.device)
-                    #     .unsqueeze(0)
-                    #     .expand(batch_size, max_seq_len)
-                    # )
-                    # lengths_expand = audio_feat_lengths.unsqueeze(1).expand(batch_size, max_seq_len)
-                    # # Create mask
-                    # padding_mask = seq_range >= lengths_expand
-                    #
-                    # if self.audio_tower._attn_implementation != "flash_attention_2":
-                    #     audio_attention_mask_ = padding_mask.view(batch_size, 1, 1, max_seq_len).expand(
-                    #         batch_size, 1, max_seq_len, max_seq_len
-                    #     )
-                    #     audio_attention_mask = audio_attention_mask_.to(
-                    #         dtype=self.audio_tower.conv1.weight.dtype, device=self.audio_tower.conv1.weight.device
-                    #     )
-                    #     audio_attention_mask[audio_attention_mask_] = float("-inf")
-                    # else:
-                    #     audio_attention_mask = (1 - padding_mask.float()).bool()
-
                     # TODO: add no_grad to this part if the audio_tower is frozen.
 
                     video_features = self.video_feature_projector(selected_video_feature)
@@ -295,9 +422,8 @@ class MemoryEfficientQwen2AVLM(MemoryEfficientQwen2AudioLM):
                     video_features = video_features.to(inputs_embeds.device, inputs_embeds.dtype)
                     inputs_embeds = inputs_embeds.masked_scatter(special_video_mask, video_features)
 
-        # After replacing the <AUDIO> with audio encoded features
-
-        outputs = self.language_model(
+        # After replacing the <AUDIO> and <VIDEO> with audio encoded features
+        outputs = self.forward_lm(
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
@@ -308,14 +434,12 @@ class MemoryEfficientQwen2AVLM(MemoryEfficientQwen2AudioLM):
             return_dict=return_dict,
         )
 
-        # TODO : get the output hidden states from language model only, not the states
         logits = outputs[0]
 
         loss = None
         ce_loss = 0
         additional_losses = {}
 
-        # TODO : get the
         if labels is not None:
 
             full_length = logits.size(1)
@@ -359,21 +483,22 @@ class MemoryEfficientQwen2AVLM(MemoryEfficientQwen2AudioLM):
                     shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1).to(shift_logits.device)
                 )
 
-            if self.kl_scale > 0 and self.training:
-                kl_loss = self._compute_kl()
-                kl_loss = kl_loss.to(dtype=ce_loss.dtype)
-                kl_loss_data = kl_loss.item()
-
-                loss = ce_loss + kl_loss * self.kl_scale
-
-            else:
-                kl_loss, kl_loss_data = 0, 0
-                loss = ce_loss
+            # if self.kl_scale > 0 and self.training:
+            #     kl_loss = self._compute_kl()
+            #     kl_loss = kl_loss.to(dtype=ce_loss.dtype)
+            #     kl_loss_data = kl_loss.item()
+            #
+            #     loss = ce_loss + kl_loss * self.kl_scale
+            #
+            # else:
+            # kl_loss, kl_loss_data = 0, 0
+            # loss = ce_loss
 
             ce_loss_data = ce_loss.item()
             additional_losses["ce_loss"] = ce_loss_data
-            if self.kl_scale > 0.0:
-                additional_losses["kl_loss"] = kl_loss_data
+            loss = ce_loss
+            # if self.kl_scale > 0.0:
+            #     additional_losses["kl_loss"] = kl_loss_data
 
         else:
             logits = self.language_model.lm_head(logits)
@@ -393,39 +518,17 @@ class MemoryEfficientQwen2AVLM(MemoryEfficientQwen2AudioLM):
         )
 
 
-from qwen2.qwen2model import (MemoryOptimizedQwen2AudioEncoder, MemoryEfficientLayerNorm,
-                              Qwen2RMSNorm, FusedRMSNorm, Qwen2MLP, SwiGLU_mlp, copy_weight)
-
-from qwen2.qwen2model import fast_layer_norm_cuda, fast_rms_norm_cuda, fast_xentropy, swiglu_mlp_cuda
-
-
-def create_qwen2av_model(load_path,
-                         config,
-                         torch_dtype,
-                         trust_remote_code=True,
-                         attn_implementation="flash_attention_2",
-                         low_cpu_mem_usage=False,
-                         device_map="none",
-                         mem_efficient=True,
-                         create_if_missing=False):
+def create_llama3av_model(load_path,
+                          config,
+                          torch_dtype,
+                          trust_remote_code=True,
+                          attn_implementation="flash_attention_2",
+                          low_cpu_mem_usage=False,
+                          device_map="none",
+                          mem_efficient=True,
+                          create_if_missing=False):
     # here model_name can be either the huggingface path, or the local path
     print("[INFO] Creating Qwen2AV model from %s" % load_path)
-
-    def replace_audio_encoder(model):
-        config = model.audio_tower.config
-
-        old_encoder = model.audio_tower
-
-        new_encoder = MemoryOptimizedQwen2AudioEncoder(config)
-
-        # Copy weights from the old layer to the new one
-        new_encoder.load_state_dict(old_encoder.state_dict())
-
-        dtype = next(old_encoder.parameters()).dtype
-
-        new_encoder.to(dtype)
-
-        model.audio_tower = new_encoder
 
     def replace_layernorm_with_memory_efficient(model):
         for name, module in model.named_children():
@@ -449,7 +552,7 @@ def create_qwen2av_model(load_path,
     def replace_rmsnorm_with_memory_efficient(model):
         for name, module in model.named_children():
             # Check if the current module is LayerNorm
-            if isinstance(module, Qwen2RMSNorm):
+            if isinstance(module, LlamaRMSNorm):
 
                 # custom_layer = EfficientQwen2RMSNorm(module.weight.numel(), module.variance_epsilon)
                 custom_layer = FusedRMSNorm(module.weight.numel(), eps=module.variance_epsilon, memory_efficient=True)
@@ -468,7 +571,7 @@ def create_qwen2av_model(load_path,
     def replace_mlp_with_memory_efficient(model):
         for name, module in model.named_children():
             # Check if the current module is LayerNorm
-            if isinstance(module, Qwen2MLP):
+            if isinstance(module, LlamaMLP):
 
                 # custom_layer = MLPSwiGLU(module.hidden_size, module.intermediate_size)
                 custom_layer = SwiGLU_mlp(module.hidden_size, module.intermediate_size)
@@ -483,7 +586,7 @@ def create_qwen2av_model(load_path,
                 # Recursively apply to submodules
                 replace_mlp_with_memory_efficient(module)
 
-    model_class = MemoryEfficientQwen2AVLM
+    model_class = MemoryEfficientLLama3AVLM
 
     # load = len(model_name > 0)
 
@@ -503,9 +606,6 @@ def create_qwen2av_model(load_path,
                                                 torch_dtype=torch_dtype,
                                                 attn_implementation=attn_implementation)
     else:
-        # model = model_class(config)
-        # model = model.to(torch_dtype)
-
         print("No checkpoint found, creating new model from config.")
         model = model_class(config)
         model = model.to(torch_dtype)
@@ -515,8 +615,6 @@ def create_qwen2av_model(load_path,
             model.save_pretrained(load_path)
 
     if mem_efficient:
-        replace_audio_encoder(model)
-        #     replace_layer_with_weights(model, model.config)
         if fast_layer_norm_cuda:
             replace_layernorm_with_memory_efficient(model)
 
@@ -529,4 +627,4 @@ def create_qwen2av_model(load_path,
     return model
 
 
-AutoModel.register(Qwen2AudioVideoConfig, MemoryEfficientQwen2AVLM)
+AutoModel.register(LLama3AVConfig, MemoryEfficientLLama3AVLM)

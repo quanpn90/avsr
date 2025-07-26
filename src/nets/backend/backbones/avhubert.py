@@ -209,11 +209,12 @@ class SubModel(nn.Module):
 class AVHubertModel(PreTrainedModel):
     config_class = Wav2Vec2Config
     base_model_prefix = "avhubert"
+    # _supports_flash_attn_2 = True
 
     # main_input_name = "input_values"
-    # supports_gradient_checkpointing = True
-    # _supports_flash_attn_2 = True
-    # _supports_sdpa = True
+    supports_gradient_checkpointing = True
+    _supports_flash_attn_2 = True
+    _supports_sdpa = True
 
     def __init__(
             self,
