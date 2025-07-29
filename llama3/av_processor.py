@@ -104,6 +104,9 @@ class Llama3AVProcessor(ProcessorMixin):
                 print(token, vocab[token])
 
         self.debug = debug
+        self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+        self.tokenizer.padding_side = "left"
 
     def get_video_lengths(self, videos):
 

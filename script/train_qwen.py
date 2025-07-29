@@ -373,42 +373,40 @@ if __name__ == "__main__":
         config = LLama3AVConfig.from_pretrained(llama3av_base)
 
         load_checkpoint = (model_name_or_path is not None and os.path.exists(model_name_or_path))
-        if model_name_or_path:
-            avsr_model = create_llama3av_model(model_name_or_path, config,
-                                               torch_dtype=torch_dtype,
-                                               attn_implementation=attention_type, device_map={"": device},
-                                               create_if_missing=False)
-        else:
-            model_name_or_path = llama3av_base
-            print("Loading model from scratch")
-            avsr_model = create_llama3av_model(model_name_or_path, config,
-                                               torch_dtype=torch_dtype,
-                                               attn_implementation=attention_type, device_map={"": device},
-                                               create_if_missing=True)
+        # if model_name_or_path:
+        #     avsr_model = create_llama3av_model(model_name_or_path, config,
+        #                                        torch_dtype=torch_dtype,
+        #                                        attn_implementation=attention_type, device_map={"": device},
+        #                                        create_if_missing=False)
+        # else:
+        #     model_name_or_path = llama3av_base
+        print("Loading model from scratch")
+        avsr_model = create_llama3av_model(llama3av_base, config,
+                                           torch_dtype=torch_dtype,
+                                           attn_implementation=attention_type,
+                                           device_map={"": device},
+                                           create_if_missing=True)
 
         avsr_model.set_audio_mask(args)
         avsr_model.label_smoothing = args.label_smoothing
 
-        # if we don't load the checkpoint: load pretrained weights
-        # if not load_checkpoint:
-        #     avsr_model.load_pretrained_avhubert(cache_dir=cache_dir)
-        #     avsr_model.load_pretrained_qwen2audio(model_name=qwenav_base,
-        #                                           cache_dir=cache_dir)
-
         processor = Llama3AVProcessor.from_pretrained(llama3av_base, trust_remote_code=True)
         processor.tokenizer.pad_token = processor.tokenizer.eos_token
 
+        from script.train_util import create_lora
+
         # ######### LORA ###################
         ## TODO: more option to control which weights to fine tune
-        lora_target_modules = ["q_proj", "v_proj"]
-        # lora_target_modules = "all-linear"
-
-        lora_config = LoraConfig(r=16, lora_alpha=64,
-                                 target_modules=lora_target_modules, lora_dropout=0.05,
-                                 bias="none")
-
-        avsr_model.language_model.add_adapter(lora_config)
-        avsr_model.audio_tower.add_adapter(lora_config)
+        # lora_target_modules = ["q_proj", "v_proj"]
+        # # lora_target_modules = "all-linear"
+        #
+        # lora_config = LoraConfig(r=16, lora_alpha=64,
+        #                          target_modules=lora_target_modules, lora_dropout=0.05,
+        #                          bias="none")
+        #
+        # avsr_model.language_model.add_adapter(lora_config)
+        # avsr_model.audio_tower.add_adapter(lora_config)
+        avsr_model = create_lora(avsr_model)
 
         module = avsr_model.video_feature_projector
         for param in module.parameters():
@@ -419,7 +417,14 @@ if __name__ == "__main__":
             for param in module.parameters():
                 param.requires_grad = True
 
-        ######### DATASET ################
+        # if model_name_or_path and os.path.exists(model_name_or_path):
+        #     print("Loading model weights from: ", model_name_or_path)
+        #     from train_util import load_sharded_state_dict
+        #
+        #     state_dict = load_sharded_state_dict(model_name_or_path)
+        #     avsr_model.load_state_dict(state_dict)
+
+        # DATASET CREATION
 
         # Load dataset
         train_dataset, valid_dataset, interference_dataset = load_avsr_dataset(streaming=streaming_dataset,
@@ -448,56 +453,22 @@ if __name__ == "__main__":
         from src.dataset.qwen_av_dataset import WavAudioTransform, Qwen2AVDataCollator
         from qwen2.av_processor import Qwen2AudioVideoProcessor
 
-        qwen2audio_config = Qwen2AudioConfig.from_pretrained(qwenav_base)
         torch_dtype = torch.bfloat16 if args.bf16 else torch.float32
         device = device if torch.cuda.is_available() else "cpu"
         attention_type = "flash_attention_2"
+        prototype_path = "./qwen2av_base/"
+        config = Qwen2AudioVideoConfig.from_pretrained(prototype_path)
 
-        avhubert_config = AVHubertAVSRConfig(odim=qwen2audio_config.vocab_size,
-                                             attn_implementation=attention_type)
-
-        # Create config for Full model
-        config = Qwen2AudioVideoConfig(qwen2audio_config=qwen2audio_config,
-                                       avhubert_config=avhubert_config,
-                                       finetune_qwen2audio=args.finetune_qwen2audio,
-                                       finetune_avhubert=args.finetune_avhubert)
-
-        load_checkpoint = (model_name_or_path is not None and os.path.exists(model_name_or_path))
-        if model_name_or_path:
-            avsr_model = create_qwen2av_model(model_name_or_path, config,
-                                              torch_dtype=torch_dtype,
-                                              attn_implementation=attention_type, device_map={"": device},
-                                              create_if_missing=False)
-        else:
-            model_name_or_path = "./qwenav-prototype"
-            print("Loading model from scratch")
-            avsr_model = create_qwen2av_model(model_name_or_path, config,
-                                              torch_dtype=torch_dtype,
-                                              attn_implementation=attention_type, device_map={"": device},
-                                              create_if_missing=True)
-
-        avsr_model.set_audio_mask(args)
-        avsr_model.label_smoothing = args.label_smoothing
-
-        # if we don't load the checkpoint: load pretrained weights
-        if not load_checkpoint:
-            avsr_model.load_pretrained_avhubert(cache_dir=cache_dir)
-            avsr_model.load_pretrained_qwen2audio(model_name=qwenav_base,
-                                                  cache_dir=cache_dir)
+        avsr_model = create_qwen2av_model(prototype_path, config,
+                                          torch_dtype=torch_dtype,
+                                          attn_implementation=attention_type, device_map={"": device},
+                                          create_if_missing=True)
 
         processor = Qwen2AudioVideoProcessor.from_pretrained(qwenav_base, trust_remote_code=True)
 
         # ######### LORA ###################
-        ## TODO: more option to control which weights to fine tune
-        lora_target_modules = ["q_proj", "v_proj"]
-        # lora_target_modules = "all-linear"
-
-        lora_config = LoraConfig(r=16, lora_alpha=64,
-                                 target_modules=lora_target_modules, lora_dropout=0.05,
-                                 bias="none")
-
-        avsr_model.language_model.add_adapter(lora_config)
-        avsr_model.audio_tower.add_adapter(lora_config)
+        from script.train_util import create_lora
+        avsr_model = create_lora(avsr_model)
 
         module = avsr_model.video_feature_projector
         for param in module.parameters():

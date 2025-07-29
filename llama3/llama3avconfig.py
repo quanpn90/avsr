@@ -33,6 +33,7 @@ class LLama3AVConfig(PretrainedConfig):
     # hardcode the indices?
     audio_token_index = 128256
     video_token_index = 128259
+    pad_token_id = 128001
 
     def __init__(
             self,

@@ -302,7 +302,7 @@ class AVHubertModel(PreTrainedModel):
         )
         nn.init.uniform_(self.label_embs_concat)
 
-        self._use_flash_attention_2 = False
+        # self._use_flash_attention_2 = False
 
     def upgrade_state_dict_named(self, state_dict, name):
         """Upgrade a (possibly old) state dict for new versions of fairseq."""

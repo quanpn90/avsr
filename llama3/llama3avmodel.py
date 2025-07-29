@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import torch.nn as nn
 from typing import Optional, Tuple, Union, Dict
 from transformers.cache_utils import Cache
-from transformers import Qwen2AudioForConditionalGeneration
+from transformers import Qwen2AudioForConditionalGeneration, GenerationMixin
 from transformers.modeling_outputs import (
     BaseModelOutputWithPast,
     CausalLMOutputWithPast,
@@ -81,8 +81,10 @@ class Llama3AVAudioProjector(nn.Module):
         return hidden_states
 
 
-class MemoryEfficientLLama3AVLM(LLama3AVPreTrainedModel):
+class MemoryEfficientLLama3AVLM(LLama3AVPreTrainedModel, GenerationMixin):
     config_class = LLama3AVConfig
+    whisper_encoder_mask_prob = 0.0
+    avhubert_encoder_mask_prob = 0.0
 
     def __init__(self, config: LLama3AVConfig):
         super().__init__(config)
@@ -100,6 +102,9 @@ class MemoryEfficientLLama3AVLM(LLama3AVPreTrainedModel):
 
         config.avhubert_config.audio_dropout = 1.0
         config.avhubert_config.modality_dropout = config.avhubert_audio_mask_prob
+
+        # hardcode?
+        config.avhubert_config._attn_implementation = "flash_attention_2"
         self.avhubert_encoder = AVHubertModel(config.avhubert_config)
 
         # finally create the link between avencoder and language model
@@ -290,6 +295,10 @@ class MemoryEfficientLLama3AVLM(LLama3AVPreTrainedModel):
         >>> processor.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
         "Generate the caption in English: Glass is breaking."
         ```"""
+
+        # if self.training:
+        #     print("[INPUTS]", input_ids)
+
         if not hasattr(self.config, "audio_token_id"):
             self.config.audio_token_id = self.config.audio_token_index
 

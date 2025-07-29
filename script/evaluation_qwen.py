@@ -124,7 +124,7 @@ class Qwen2AudioModel(BaseInferenceModel):
             avsr_model = PeftModel.from_pretrained(avsr_model, model_path)
             avsr_model.merge_and_unload()
 
-        avsr_model.eval().cuda()
+        avsr_model.eval().cuda().to(self.dtype)
         self.model = avsr_model
         self.processor = processor
 
@@ -197,6 +197,288 @@ class Qwen2AudioModel(BaseInferenceModel):
         return pred_transcript
 
 
+class Qwen2AVModel(BaseInferenceModel):
+    """AVSR Cocktail model implementation"""
+
+    version = 1.0
+
+    def load_model(self):
+        from qwen2.qwen2avconfig import Qwen2AudioVideoConfig, Qwen2AudioConfig
+        from src.avhubert_avsr.configuration_avhubert_avsr import AVHubertAVSRConfig
+        from qwen2.qwen2avmodel import create_qwen2av_model
+
+        from transformers import PreTrainedModel
+        from src.dataset.qwen_av_dataset import WavAudioTransform, Qwen2AVEvalCollator
+        from src.dataset.avhubert_dataset import VideoTransform
+        from qwen2.av_processor import Qwen2AudioVideoProcessor
+        from script.train_util import load_sharded_state_dict, create_lora, merge_lora
+        from script.train_qwen import skip_check_and_enable_flash_attn_2
+        PreTrainedModel._check_and_enable_flash_attn_2 = classmethod(skip_check_and_enable_flash_attn_2)
+
+        attention_type = "flash_attention_2"
+        qwenav_prototype = "./qwenav-prototype"
+        qwenav_base = "./qwenav_base"
+
+        processor = Qwen2AudioVideoProcessor.from_pretrained(qwenav_base, trust_remote_code=True)
+
+        # config = Qwen2AudioVideoConfig.from_pretrained(self.checkpoint_path)
+        qwen2audio_config = Qwen2AudioConfig.from_pretrained(qwenav_base)
+        qwen2audio_config._attn_implementation = "flash_attention_2"
+        avhubert_config = AVHubertAVSRConfig(odim=qwen2audio_config.vocab_size,
+                                             attn_implementation=attention_type)
+        avhubert_config._attn_implementation = "flash_attention_2"
+
+        config = Qwen2AudioVideoConfig(qwen2audio_config=qwen2audio_config,
+                                       avhubert_config=avhubert_config)
+        config._attn_implementation = "flash_attention_2"
+        torch_dtype = self.dtype
+        device = torch.device(f"cuda:{self.worker_id}")
+
+        # Load text transform
+        avsr_model = create_qwen2av_model("", config,
+                                          torch_dtype=torch_dtype,
+                                          attn_implementation=attention_type, device_map={"": device},
+                                          create_if_missing=True)
+
+        avsr_model = create_lora(avsr_model)
+
+        model_path = self.checkpoint_path
+        state_dict = load_sharded_state_dict(model_path)
+        avsr_model.load_state_dict(state_dict)
+
+        avsr_model = merge_lora(avsr_model)
+
+        # # Load data collator
+        audio_transform = WavAudioTransform(subset="test")
+        video_transform = VideoTransform(subset="test")
+
+        if self.version == 1.0:
+            prompt_template = "<|video_bos|><|VIDEO|><|video_eos|> <|audio_bos|><|AUDIO|><|audio_eos|> Transcribe this speech:"
+        else:
+            prompt_template = "<|video_bos|><|VIDEO|><|video_eos|><|audio_bos|><|AUDIO|><|audio_eos|>Transcribe this speech:"
+        #
+        self.av_data_collator = Qwen2AVEvalCollator(
+            processor,
+            prompt_template=prompt_template,
+            video_transform=video_transform,
+            audio_transform=audio_transform,
+            version=self.version
+        )
+
+        avsr_model.eval().cuda().to(self.dtype)
+        self.model = avsr_model
+        self.processor = processor
+
+    def inference(self, inputs, **kwargs):
+        # avhubert_features = self.model.encoder(
+        #     input_features=audios,
+        #     video=videos,
+        # )
+        # audiovisual_feat = avhubert_features.last_hidden_state
+        # audiovisual_feat = audiovisual_feat.squeeze(0)
+        #
+        # nbest_hyps = self.beam_search(audiovisual_feat)
+        # nbest_hyps = [h.asdict() for h in nbest_hyps[:min(len(nbest_hyps), 1)]]
+        # predicted_token_id = torch.tensor(list(map(int, nbest_hyps[0]["yseq"][1:])))
+        # predicted = self.text_transform.post_process(predicted_token_id).replace("<eos>", "")
+
+        eos_id = self.av_data_collator.eos_token_id
+        processor = self.processor
+        generated_ids = self.model.generate(
+            **inputs,
+            max_length=1024,
+            num_beams=self.beam_size,
+            no_repeat_ngram_size=self.no_repeat_ngram_size,
+            # repetition_penalty=1.2,
+            # length_penalty=0.9,
+            early_stopping=True,
+            pad_token_id=self.processor.tokenizer.pad_token_id,
+            eos_token_id=eos_id
+            # 🔥 Remove top_k / top_p when not sampling
+            # top_k=0,
+            # top_p=0.01,
+        )
+
+        # Remove prompt tokens
+        prompt_lens = inputs["input_ids"].ne(processor.tokenizer.pad_token_id).sum(dim=1)
+        clean_outputs = [
+            gen_ids[prompt_len:] for gen_ids, prompt_len in zip(generated_ids, prompt_lens)
+        ]
+
+        responses = processor.batch_decode(
+            clean_outputs,
+            skip_cspecial_tokens=True,
+            clean_up_tokenization_spaces=True
+        )
+
+        def strip_known_tags(text):
+
+            for tag in ["<|en|>", "<|endoftext|>", "<|AUDIO|>", "<|audio_eos|>", "[noise]", "<|audio_bos|>"]:
+                text = text.replace(tag, "")
+
+            text = text.strip()
+
+            if text.startswith("Transcribe this speech:"):
+                text = text[len("Transcribe this speech:"):]
+
+            def remove_bracket_tags(text):
+                # Removes [anything in square brackets], including the brackets
+                return re.sub(r'\[[^\]]*\]', '', text).strip()
+
+            text = remove_bracket_tags(text)
+
+            def remove_language_tags(text):
+                return re.sub(r'<\|[a-zA-Z_-]+?\|>', '', text)
+
+            text = remove_language_tags(text)
+
+            return text
+
+        pred_transcript = [strip_known_tags(d).strip() for d in responses]
+        # predictions_lst.extend(pred_transcript)
+        # target_lst.extend(refs)
+
+        return pred_transcript
+
+
+class Llama3AVModel(BaseInferenceModel):
+    """AVSR Cocktail model implementation"""
+
+    version = 1.0
+
+    def load_model(self):
+        llama3av_base = "llama3av-base"
+        from transformers import PreTrainedModel
+        from script.train_qwen import skip_check_and_enable_flash_attn_2
+        PreTrainedModel._check_and_enable_flash_attn_2 = classmethod(skip_check_and_enable_flash_attn_2)
+
+        from llama3.llama3avmodel import LLama3AVConfig, MemoryEfficientLLama3AVLM
+        from llama3.llama3avmodel import create_llama3av_model
+        from src.dataset.qwen_av_dataset import WavAudioTransform
+        from src.dataset.llama_av_dataset import LLama3AVDataCollator
+        from llama3.av_processor import Llama3AVProcessor
+
+        attention_type = "flash_attention_2"
+        torch_dtype = self.dtype
+        device = torch.device(f"cuda:{self.worker_id}")
+
+        from src.dataset.llama_av_dataset import WavAudioTransform, LLama3AVEvalCollator
+        from src.dataset.avhubert_dataset import VideoTransform
+
+        from llama3.av_processor import Llama3AVProcessor
+        from script.train_util import load_sharded_state_dict, create_lora, merge_lora
+
+        config = LLama3AVConfig.from_pretrained(llama3av_base)
+
+        avsr_model = create_llama3av_model(llama3av_base, config,
+                                           torch_dtype=torch_dtype,
+                                           attn_implementation=attention_type,
+                                           device_map={"": device},
+                                           create_if_missing=True)
+
+        processor = Llama3AVProcessor.from_pretrained(llama3av_base, trust_remote_code=True)
+        processor.tokenizer.pad_token = processor.tokenizer.eos_token
+
+        avsr_model = create_lora(avsr_model)
+
+        model_path = self.checkpoint_path
+        state_dict = load_sharded_state_dict(model_path)
+        avsr_model.load_state_dict(state_dict)
+
+        avsr_model = merge_lora(avsr_model)
+
+        # # Load data collator
+        audio_transform = WavAudioTransform(subset="test")
+        video_transform = VideoTransform(subset="test")
+
+        prompt_template = "<|video_bos|><|VIDEO|><|video_eos|><|audio_bos|><|AUDIO|><|audio_eos|>Transcribe this speech:"
+
+        self.av_data_collator = LLama3AVEvalCollator(
+            processor,
+            prompt_template=prompt_template,
+            video_transform=video_transform,
+            audio_transform=audio_transform,
+            version=self.version
+        )
+        #
+        avsr_model.eval().cuda().to(self.dtype)
+        self.model = avsr_model
+        self.processor = processor
+
+    def inference(self, inputs, **kwargs):
+        # avhubert_features = self.model.encoder(
+        #     input_features=audios,
+        #     video=videos,
+        # )
+        # audiovisual_feat = avhubert_features.last_hidden_state
+        # audiovisual_feat = audiovisual_feat.squeeze(0)
+        #
+        # nbest_hyps = self.beam_search(audiovisual_feat)
+        # nbest_hyps = [h.asdict() for h in nbest_hyps[:min(len(nbest_hyps), 1)]]
+        # predicted_token_id = torch.tensor(list(map(int, nbest_hyps[0]["yseq"][1:])))
+        # predicted = self.text_transform.post_process(predicted_token_id).replace("<eos>", "")
+
+        eos_id = self.av_data_collator.eos_token_id
+        processor = self.processor
+        generated_ids = self.model.generate(
+            **inputs,
+            max_length=1024,
+            num_beams=self.beam_size,
+            no_repeat_ngram_size=self.no_repeat_ngram_size,
+            # repetition_penalty=1.2,
+            # length_penalty=0.9,
+            early_stopping=True,
+            pad_token_id=eos_id,
+            eos_token_id=eos_id,
+            # 🔥 Remove top_k / top_p when not sampling
+            # top_k=0,
+            # top_p=0.01,
+        )
+
+        # Remove prompt tokens
+        prompt_lens = inputs["input_ids"].ne(eos_id).sum(dim=1)
+        clean_outputs = [
+            gen_ids[prompt_len:] for gen_ids, prompt_len in zip(generated_ids, prompt_lens)
+        ]
+
+        print("\n", "[OUTPUT IDS]", clean_outputs)
+
+        responses = processor.batch_decode(
+            clean_outputs,
+            skip_cspecial_tokens=True,
+            clean_up_tokenization_spaces=True
+        )
+
+        def strip_known_tags(text):
+
+            for tag in ["<|en|>", "<|endoftext|>", "<|AUDIO|>", "<|audio_eos|>", "[noise]", "<|audio_bos|>"]:
+                text = text.replace(tag, "")
+
+            text = text.strip()
+
+            if text.startswith("Transcribe this speech:"):
+                text = text[len("Transcribe this speech:"):]
+
+            def remove_bracket_tags(text):
+                # Removes [anything in square brackets], including the brackets
+                return re.sub(r'\[[^\]]*\]', '', text).strip()
+
+            text = remove_bracket_tags(text)
+
+            def remove_language_tags(text):
+                return re.sub(r'<\|[a-zA-Z_-]+?\|>', '', text)
+
+            text = remove_language_tags(text)
+
+            return text
+
+        pred_transcript = [strip_known_tags(d).strip() for d in responses]
+        # predictions_lst.extend(pred_transcript)
+        # target_lst.extend(refs)
+
+        return pred_transcript
+
+
 class InferenceEngine:
     """Main inference engine that handles model selection and processing"""
 
@@ -215,6 +497,7 @@ class InferenceEngine:
         self.max_length = max_length
         self.worker_id = worker_id
         self.model_impl = self._get_model_implementation()
+        self.dtype = torch.bfloat16
 
     def _get_model_implementation(self) -> BaseInferenceModel:
         """Factory method to get the appropriate model implementation"""
@@ -226,7 +509,12 @@ class InferenceEngine:
         #     return MuAViCModel(self.checkpoint_path, self.cache_dir, self.beam_size, worker_id=self.worker_id)
         # else:
         #     raise ValueError(f"Unknown model type: {self.model_type}")
-        return Qwen2AudioModel(self.checkpoint_path, self.cache_dir, self.beam_size, worker_id=self.worker_id)
+        if self.model_type in ['llama3av']:
+            return Llama3AVModel(self.checkpoint_path, self.cache_dir, self.beam_size, worker_id=self.worker_id)
+        elif self.model_type in ['qwenav', 'qwen2av', 'qwen2_av']:
+            return Qwen2AVModel(self.checkpoint_path, self.cache_dir, self.beam_size, worker_id=self.worker_id)
+        else:
+            return Qwen2AudioModel(self.checkpoint_path, self.cache_dir, self.beam_size, worker_id=self.worker_id)
 
     def load_model(self):
         """Load the selected model"""
@@ -284,16 +572,16 @@ class InferenceEngine:
         inputs = self.model_impl.av_data_collator([sample])
         for key in inputs:
             inputs[key] = inputs[key].cuda()
-        # audios = sample_features["audios"].cuda()
-        # videos = sample_features["videos"].cuda()
-        # audio_lengths = sample_features["audio_lengths"].cuda()
-        # video_lengths = sample_features["video_lengths"].cuda()
+            if inputs[key].dtype == torch.float32:
+                inputs[key] = inputs[key].to(torch.bfloat16)
+            # print(key, inputs[key])
 
-        try:
-            output = self.model_impl.inference(inputs)
-        except Exception as e:
-            print(f"Error during inference for segment {sample}")
-            raise e
+        output = self.model_impl.inference(inputs)
+        # try:
+        #     output = self.model_impl.inference(inputs)
+        # except Exception as e:
+        #     print(f"Error during inference for segment {sample}")
+        #     raise e
 
         return output
 
@@ -309,12 +597,15 @@ class InferenceEngine:
                 "start_time": seg[0],
                 "end_time": seg[1],
             }
+
+            # print(self.model_impl.av_data_collator)
             sample_features = self.model_impl.av_data_collator([sample])
             audios = sample_features["audios"].cuda()
             videos = sample_features["videos"].cuda()
             audio_lengths = sample_features["audio_lengths"].cuda()
             video_lengths = sample_features["video_lengths"].cuda()
 
+            # print(self.model_impl)
             try:
                 output = self.model_impl.inference(videos, audios)
             except Exception as e:
@@ -389,7 +680,6 @@ class InferenceEngine:
 
 
 def _eval_lrs2_single_worker(args, dataset, worker_id, result_queue):
-    print(dataset, flush=True)
     engine = InferenceEngine(args.model_type, args.checkpoint_path,
                              args.cache_dir, args.beam_size, args.max_length,
                              worker_id=worker_id)
@@ -409,6 +699,9 @@ def _eval_lrs2_single_worker(args, dataset, worker_id, result_queue):
         output_norm = norm_string(output.lower().replace("<unk>", ""))
 
         # print(output_norm, label_norm)
+        print("")
+        print("[HYP]", output_norm)
+        print("[REF]", label_norm)
 
         output_list.append(output_norm)
         label_list.append(label_norm)
@@ -516,8 +809,8 @@ def main():
         '--model_type',
         type=str,
         # required=True,
-        default='avsr_cocktail',
-        choices=['avsr_cocktail', 'auto_avsr', 'muavic_en'],
+        default='qwen2audio',
+        choices=['qwen2av', 'qwen2audio', 'llama3av'],
         help='Type of model to use for inference'
     )
 
@@ -608,13 +901,11 @@ def main():
                 list_wer_scores.append(wer_score)
                 print(f"WER {set_id}: {wer_score:.4f}")
             print(f"Average WER: {sum(list_wer_scores) / len(list_wer_scores):.4f}")
-            print("HELLO1")
         else:
             print(f"Inferring {args.dataset_name}/{args.set_id} sessions using {args.model_type} model")
             dataset = datasets.load_dataset("nguyenvulebinh/AVYT", args.dataset_name, cache_dir='./data-bin/cache',
                                             streaming=True)[args.set_id]
 
-            print("HELLO2")
             wer_score = eval_lrs2(args, dataset)
             print(f"WER: {wer_score}")
     elif args.dataset_name == 'AVCocktail':

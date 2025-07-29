@@ -24,6 +24,11 @@ tokenizer = AutoTokenizer.from_pretrained(default_llama,
 
 eos = tokenizer.eos_token
 print(eos)
+eos_id = tokenizer.eos_token_id
+print(eos_id)
+
+text = "I have no idea"
+print(tokenizer(text + tokenizer.eos_token, add_special_tokens=False)["input_ids"])
 
 
 
@@ -46,7 +51,9 @@ print("Processor initialized successfully!")
 test_dataset = datasets.load_dataset("nguyenvulebinh/AVYT", "lrs2", streaming=True,
                                      cache_dir=cache_dir).remove_columns(['__key__', '__url__'])['train']
 
-sample = next(iter(test_dataset))
+iterator = iter(test_dataset)
+sample = next(iterator)
+sample2 = next(iterator)
 
 video_array = sample['video']
 text = sample["label"].decode(encoding="utf-8")
@@ -55,9 +62,20 @@ audio = load_audio(video_array).squeeze().numpy()
 video = load_video(video_array)
 
 prompt_template = "<|video_bos|><|VIDEO|><|video_eos|><|audio_bos|><|AUDIO|><|audio_eos|>Transcribe this speech:"
-text = prompt_template + text.lower()
+text = prompt_template + "<|begin_of_text|>" + text.lower() + tokenizer.eos_token
 
-inputs = processor(text, audio, video)
+
+video_array2 = sample2['video']
+text2 = sample2["label"].decode(encoding="utf-8") + " but I don't know"
+
+audio2 = load_audio(video_array2).squeeze().numpy()
+video2 = load_video(video_array2)
+
+text2 = prompt_template + "<|begin_of_text|>" + text2.lower() + tokenizer.eos_token
+
+
+inputs = processor(text=[text, text2], audio=[audio, audio2], video=[video, video2],
+                   return_tensors="pt", padding=True)
 
 print(text)
 print(inputs.keys())

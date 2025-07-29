@@ -24,6 +24,8 @@ logger = logging.get_logger(__name__)
 
 class MemoryEfficientQwen2AVLM(MemoryEfficientQwen2AudioLM):
     config_class = Qwen2AudioVideoConfig
+    whisper_encoder_mask_prob = 0.0
+    avhubert_encoder_mask_prob = 0.0
 
     def __init__(self, config: Qwen2AudioVideoConfig):
         # first we create audio encoder and language model
@@ -160,6 +162,7 @@ class MemoryEfficientQwen2AVLM(MemoryEfficientQwen2AudioLM):
 
             # 2. Merge text and audios
             if input_features is not None and input_ids.shape[1] != 1:
+
                 context = torch.no_grad() if self.freeze_audio_encoder else nullcontext()
                 with context:
                     audio_feat_lengths, audio_output_lengths = self.audio_tower._get_feat_extract_output_lengths(
@@ -198,35 +201,41 @@ class MemoryEfficientQwen2AVLM(MemoryEfficientQwen2AudioLM):
                     audio_tokens = input_ids == self.config.audio_token_id
                     legacy_processing = (audio_tokens[:, :-1] & audio_tokens[:, 1:]).sum() == 0
 
-                    if legacy_processing:
-                        logger.warning_once(
-                            "Expanding inputs for audio tokens in Qwen2Audio should be done in processing."
+                    # if legacy_processing:
+                    #     # logger.warning_once(
+                    #     #     "Expanding inputs for audio tokens in Qwen2Audio should be done in processing."
+                    #     # )
+                    #     # inputs_embeds, attention_mask, labels, position_ids, _ = self._merge_input_ids_with_audio_features(
+                    #     #     audio_features, audio_output_lengths, inputs_embeds, input_ids, attention_mask, labels
+                    #     # )
+                    #     raise NotImplementedError
+                    # else:
+                    num_audios, max_audio_tokens, embed_dim = audio_features.shape
+                    audio_features_mask = torch.arange(max_audio_tokens, device=audio_output_lengths.device)[None,
+                                          :]
+                    audio_features_mask = audio_features_mask < audio_output_lengths[:, None]
+                    audio_features = audio_features[audio_features_mask]
+
+                    n_audio_tokens = (input_ids == self.config.audio_token_id).sum().item()
+                    n_audio_features = audio_features.shape[0]
+
+                    if n_audio_tokens != n_audio_features:
+                        print(self.config.audio_token_id)
+                        print(input_ids)
+                        raise ValueError(
+                            f"Audio features and audio tokens do not match: tokens: {n_audio_tokens}, features {n_audio_features}"
                         )
-                        inputs_embeds, attention_mask, labels, position_ids, _ = self._merge_input_ids_with_audio_features(
-                            audio_features, audio_output_lengths, inputs_embeds, input_ids, attention_mask, labels
-                        )
-                    else:
-                        num_audios, max_audio_tokens, embed_dim = audio_features.shape
-                        audio_features_mask = torch.arange(max_audio_tokens, device=audio_output_lengths.device)[None,
-                                              :]
-                        audio_features_mask = audio_features_mask < audio_output_lengths[:, None]
-                        audio_features = audio_features[audio_features_mask]
+                    special_audio_mask = (input_ids == self.config.audio_token_id).to(inputs_embeds.device)
+                    special_audio_mask = special_audio_mask.unsqueeze(-1).expand_as(inputs_embeds)
+                    audio_features = audio_features.to(inputs_embeds.device, inputs_embeds.dtype)
 
-                        n_audio_tokens = (input_ids == self.config.audio_token_id).sum().item()
-                        n_audio_features = audio_features.shape[0]
+                    # randomly mask out the features
+                    audio_features = torch.nn.functional.dropout(audio_features, self.whisper_encoder_mask_prob,
+                                                                 training=self.training)
+                    inputs_embeds = inputs_embeds.masked_scatter(special_audio_mask, audio_features)
 
-                        if n_audio_tokens != n_audio_features:
-                            raise ValueError(
-                                f"Audio features and audio tokens do not match: tokens: {n_audio_tokens}, features {n_audio_features}"
-                            )
-                        special_audio_mask = (input_ids == self.config.audio_token_id).to(inputs_embeds.device)
-                        special_audio_mask = special_audio_mask.unsqueeze(-1).expand_as(inputs_embeds)
-                        audio_features = audio_features.to(inputs_embeds.device, inputs_embeds.dtype)
-
-                        # randomly mask out the features
-                        audio_features = torch.nn.functional.dropout(audio_features, self.whisper_encoder_mask_prob,
-                                                                     training=self.training)
-                        inputs_embeds = inputs_embeds.masked_scatter(special_audio_mask, audio_features)
+            # else:
+            #     print("Ignore audio", input_ids.shape)
 
             # 3. merge text/audio and videos
             if videos is not None and input_ids.shape[1] != 1:
@@ -243,34 +252,6 @@ class MemoryEfficientQwen2AVLM(MemoryEfficientQwen2AudioLM):
                     )
 
                     selected_video_feature = avhubert_features.last_hidden_state
-
-                    # audio_feat_lengths, audio_output_lengths = self.audio_tower._get_feat_extract_output_lengths(
-                    #     feature_attention_mask.sum(-1)
-                    # )
-                    # batch_size, _, max_mel_seq_len = input_features.shape
-                    # max_seq_len = (max_mel_seq_len - 2) // 2 + 1
-                    # # Create a sequence tensor of shape (batch_size, max_seq_len)
-                    # seq_range = (
-                    #     torch.arange(0, max_seq_len, dtype=audio_feat_lengths.dtype, device=audio_feat_lengths.device)
-                    #     .unsqueeze(0)
-                    #     .expand(batch_size, max_seq_len)
-                    # )
-                    # lengths_expand = audio_feat_lengths.unsqueeze(1).expand(batch_size, max_seq_len)
-                    # # Create mask
-                    # padding_mask = seq_range >= lengths_expand
-                    #
-                    # if self.audio_tower._attn_implementation != "flash_attention_2":
-                    #     audio_attention_mask_ = padding_mask.view(batch_size, 1, 1, max_seq_len).expand(
-                    #         batch_size, 1, max_seq_len, max_seq_len
-                    #     )
-                    #     audio_attention_mask = audio_attention_mask_.to(
-                    #         dtype=self.audio_tower.conv1.weight.dtype, device=self.audio_tower.conv1.weight.device
-                    #     )
-                    #     audio_attention_mask[audio_attention_mask_] = float("-inf")
-                    # else:
-                    #     audio_attention_mask = (1 - padding_mask.float()).bool()
-
-                    # TODO: add no_grad to this part if the audio_tower is frozen.
 
                     video_features = self.video_feature_projector(selected_video_feature)
 
@@ -295,7 +276,11 @@ class MemoryEfficientQwen2AVLM(MemoryEfficientQwen2AudioLM):
                     video_features = video_features.to(inputs_embeds.device, inputs_embeds.dtype)
                     inputs_embeds = inputs_embeds.masked_scatter(special_video_mask, video_features)
 
-        # After replacing the <AUDIO> with audio encoded features
+        #     else:
+        #         print("Ignore video", input_ids.shape)
+        # # After replacing the <AUDIO> with audio encoded features
+
+        # print(use_cache, past_key_values)
 
         outputs = self.language_model(
             attention_mask=attention_mask,
@@ -315,7 +300,6 @@ class MemoryEfficientQwen2AVLM(MemoryEfficientQwen2AudioLM):
         ce_loss = 0
         additional_losses = {}
 
-        # TODO : get the
         if labels is not None:
 
             full_length = logits.size(1)
@@ -377,6 +361,8 @@ class MemoryEfficientQwen2AVLM(MemoryEfficientQwen2AudioLM):
 
         else:
             logits = self.language_model.lm_head(logits)
+
+            # print(logits.size())
 
         if not return_dict:
             output = (logits,) + outputs[1:]

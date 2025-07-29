@@ -51,6 +51,8 @@ class Qwen2AudioVideoProcessor(Qwen2AudioProcessor):
         for token in [self.video_token, self.video_bos_token, self.video_eos_token]:
             assert token in vocab
 
+        self.tokenizer.padding_side = "left"
+
     def get_video_lengths(self, videos):
 
         if type(videos) is torch.Tensor:
