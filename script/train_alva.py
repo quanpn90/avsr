@@ -283,213 +283,84 @@ if __name__ == "__main__":
     if not os.path.exists(output_dir):
         os.makedirs(output_dir, exist_ok=True)
 
-    if args.model_type == "qwen2audio":
-        from qwen2.qwen2model import create_qwen2audio_model
-        from transformers import AutoProcessor, AutoConfig
-        from src.dataset.qwen_audio_dataset import Qwen2AudioDataCollator, WavAudioTransform
+    sp_model_path = os.path.join(os.path.dirname(os.path.dirname(__file__)),
+                                 "src/tokenizer/spm/unigram/unigram5000.model")
+    dict_path = os.path.join(os.path.dirname(os.path.dirname(__file__)),
+                             "src/tokenizer/spm/unigram/unigram5000_units.txt")
+    text_transform = TextTransform(
+        sp_model_path=sp_model_path,
+        dict_path=dict_path,
+    )
 
-        model_name = "Qwen/Qwen2-Audio-7B"
-        device = device if torch.cuda.is_available() else "cpu"
+    alva_base = "alva-base"
+    from alva.alva_model import AlvaConfig, create_alva_model
 
-        # model is created in torch.float32 might cause warnings, but trainer/autocast might handle things properly
-        torch_dtype = torch.bfloat16 if args.bf16 else torch.float32
+    # llama and qwen probably can share the same data collator
+    from src.dataset.qwen_av_dataset import WavAudioTransform
+    from alva.alva_dataset import AlvaDataCollator
+    from alva.alva_processor import AlvaProcessor
 
-        processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
-        config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
-        attention_type = "flash_attention_2"
-        #
-        if model_name_or_path is not None and os.path.exists(model_name_or_path):
-            print("Loading pretrained model from", model_name_or_path)
-            avsr_model = create_qwen2audio_model(model_name_or_path, config,
-                                                 torch_dtype=torch_dtype,
-                                                 trust_remote_code=True,
-                                                 low_cpu_mem_usage=True,
-                                                 attn_implementation=attention_type,
-                                                 mem_efficient=True,
-                                                 device_map={"": device})
-            # avsr_model = AVHubertAVSR.from_pretrained(model_name_or_path)
-        else:
-            # Load from scratch
-            print("Loading model from scratch")
+    torch_dtype = torch.bfloat16 if args.bf16 else torch.float32
+    device = device if torch.cuda.is_available() else "cpu"
+    attention_type = "flash_attention_2"
 
-            avsr_model = create_qwen2audio_model(model_name, config,
-                                                 torch_dtype=torch_dtype,
-                                                 trust_remote_code=True,
-                                                 low_cpu_mem_usage=True,
-                                                 attn_implementation=attention_type,
-                                                 mem_efficient=True,
-                                                 device_map={"": device})
+    config = AlvaConfig.from_pretrained(alva_base)
 
-        ######### LORA ###################
-        lora_target_modules = ["q_proj", "v_proj"]
-        # lora_target_modules = "all-linear"
+    load_checkpoint = (model_name_or_path is not None and os.path.exists(model_name_or_path))
 
-        lora_config = LoraConfig(r=16, lora_alpha=64,
-                                 target_modules=lora_target_modules, lora_dropout=0.05,
-                                 bias="none")
+    print("Loading model from scratch")
+    avsr_model = create_alva_model(alva_base, config,
+                                   torch_dtype=torch_dtype,
+                                   attn_implementation=attention_type,
+                                   device_map={"": device},
+                                   create_if_missing=True)
 
-        avsr_model.add_adapter(lora_config)
+    avsr_model.set_audio_mask(args)
+    avsr_model.label_smoothing = args.label_smoothing
 
-        ######### DATASET ################
+    processor = AlvaProcessor.from_pretrained(alva_base, trust_remote_code=True)
+    processor.tokenizer.pad_token = processor.tokenizer.eos_token
 
-        # Load dataset
-        train_dataset, valid_dataset, interference_dataset = load_avsr_dataset(streaming=streaming_dataset,
-                                                                               include_mcorec=include_mcorec,
-                                                                               cache_dir=cache_dir)
+    from script.train_util import create_lora
 
-        train_av_data_collator = Qwen2AudioDataCollator(processor,
-                                                        audio_transform=WavAudioTransform(subset="train",
-                                                                                          speech_dataset=interference_dataset),
-                                                        )
-        valid_av_data_collator = Qwen2AudioDataCollator(processor,
-                                                        audio_transform=WavAudioTransform(subset="test")
-                                                        )
+    # Finetune all important parameters
+    # TODO: more option to control which weights to fine tune
+    avsr_model = create_lora(avsr_model, has_vision_tower=True)
 
-    elif args.model_type == "llama3_av":
+    modules = [avsr_model.cross_modal_projector, avsr_model.av_projector]
 
-        llama3av_base = "llama3av-base"
-        from llama3.llama3avmodel import LLama3AVConfig, MemoryEfficientLLama3AVLM
-        from llama3.llama3avmodel import create_llama3av_model
-
-        from transformers import AutoProcessor, AutoConfig
-
-        # llama and qwen probably can share the same data collator
-        from src.dataset.qwen_av_dataset import WavAudioTransform
-        from src.dataset.llama_av_dataset import LLama3AVDataCollator
-        from llama3.av_processor import Llama3AVProcessor
-
-        torch_dtype = torch.bfloat16 if args.bf16 else torch.float32
-        device = device if torch.cuda.is_available() else "cpu"
-        attention_type = "flash_attention_2"
-
-        # avhubert_config = AVHubertAVSRConfig(odim=qwen2audio_config.vocab_size,
-        #                                      attn_implementation=attention_type)
-        #
-        # # Create config for Full model
-        # config = Qwen2AudioVideoConfig(qwen2audio_config=qwen2audio_config,
-        #                                avhubert_config=avhubert_config,
-        #                                finetune_qwen2audio=args.finetune_qwen2audio,
-        #                                finetune_avhubert=args.finetune_avhubert)
-        config = LLama3AVConfig.from_pretrained(llama3av_base)
-
-        load_checkpoint = (model_name_or_path is not None and os.path.exists(model_name_or_path))
-        # if model_name_or_path:
-        #     avsr_model = create_llama3av_model(model_name_or_path, config,
-        #                                        torch_dtype=torch_dtype,
-        #                                        attn_implementation=attention_type, device_map={"": device},
-        #                                        create_if_missing=False)
-        # else:
-        #     model_name_or_path = llama3av_base
-        print("Loading model from scratch")
-        avsr_model = create_llama3av_model(llama3av_base, config,
-                                           torch_dtype=torch_dtype,
-                                           attn_implementation=attention_type,
-                                           device_map={"": device},
-                                           create_if_missing=True)
-
-        avsr_model.set_audio_mask(args)
-        avsr_model.label_smoothing = args.label_smoothing
-
-        processor = Llama3AVProcessor.from_pretrained(llama3av_base, trust_remote_code=True)
-        processor.tokenizer.pad_token = processor.tokenizer.eos_token
-
-        from script.train_util import create_lora
-
-        # ######### LORA ###################
-        ## TODO: more option to control which weights to fine tun
-        avsr_model = create_lora(avsr_model)
-
-        module = avsr_model.video_feature_projector
+    for module in modules:
         for param in module.parameters():
             param.requires_grad = True
 
-        if args.finetune_avhubert:
-            module = avsr_model.avhubert_encoder
-            for param in module.parameters():
-                param.requires_grad = True
+    if model_name_or_path and os.path.exists(model_name_or_path):
+        print("Loading model weights from: ", model_name_or_path)
+        from train_util import load_sharded_state_dict
 
-        if model_name_or_path and os.path.exists(model_name_or_path):
-            print("Loading model weights from: ", model_name_or_path)
-            from train_util import load_sharded_state_dict
+        state_dict = load_sharded_state_dict(model_name_or_path)
+        avsr_model.load_state_dict(state_dict)
 
-            state_dict = load_sharded_state_dict(model_name_or_path)
-            avsr_model.load_state_dict(state_dict)
+    # DATASET CREATION
 
-        # DATASET CREATION
+    # Load dataset
+    train_dataset, valid_dataset, interference_dataset = load_avsr_dataset(streaming=streaming_dataset,
+                                                                           include_mcorec=include_mcorec,
+                                                                           cache_dir=cache_dir)
 
-        # Load dataset
-        train_dataset, valid_dataset, interference_dataset = load_avsr_dataset(streaming=streaming_dataset,
-                                                                               include_mcorec=include_mcorec,
-                                                                               cache_dir=cache_dir)
-
-        prompt_template = "<|video_bos|><|VIDEO|><|video_eos|><|audio_bos|><|AUDIO|><|audio_eos|>Transcribe this speech:"
-        train_av_data_collator = LLama3AVDataCollator(processor,
-                                                      prompt_template=prompt_template,
-                                                      video_transform=VideoTransform(subset="train"),
-                                                      audio_transform=WavAudioTransform(subset="train",
-                                                                                        speech_dataset=interference_dataset),
-                                                      )
-        valid_av_data_collator = LLama3AVDataCollator(processor,
-                                                      prompt_template=prompt_template,
-                                                      video_transform=VideoTransform(subset="train"),
-                                                      audio_transform=WavAudioTransform(subset="test")
-                                                      )
-
-    elif args.model_type == "qwen2av":
-        # # TODO; qwen2av
-        from qwen2.qwen2avconfig import Qwen2AVConfig
-        from qwen2.qwen2avmodel import create_qwen2av_model
-
-        from transformers import AutoProcessor, AutoConfig
-        from src.dataset.qwen_av_dataset import WavAudioTransform, Qwen2AVDataCollator
-        from qwen2.av_processor import Qwen2AVProcessor
-
-        torch_dtype = torch.bfloat16 if args.bf16 else torch.float32
-        device = device if torch.cuda.is_available() else "cpu"
-        attention_type = "flash_attention_2"
-        prototype_path = "./qwen2av_base/"
-        config = Qwen2AVConfig.from_pretrained(prototype_path)
-
-        avsr_model = create_qwen2av_model(prototype_path, config,
-                                          torch_dtype=torch_dtype,
-                                          attn_implementation=attention_type, device_map={"": device},
-                                          create_if_missing=True)
-
-        processor = Qwen2AVProcessor.from_pretrained(qwenav_base)
-
-        # ######### LORA ###################
-        from script.train_util import create_lora
-        avsr_model = create_lora(avsr_model)
-
-        module = avsr_model.video_feature_projector
-        for param in module.parameters():
-            param.requires_grad = True
-
-        if args.finetune_avhubert:
-            module = avsr_model.avhubert_encoder
-            for param in module.parameters():
-                param.requires_grad = True
-
-        ######### DATASET ################
-
-        # Load dataset
-        train_dataset, valid_dataset, interference_dataset = load_avsr_dataset(streaming=streaming_dataset,
-                                                                               include_mcorec=include_mcorec,
-                                                                               cache_dir=cache_dir)
-        prompt_template = "<|video_bos|><|VIDEO|><|video_eos|><|audio_bos|><|AUDIO|><|audio_eos|>Transcribe this speech:"
-        train_av_data_collator = Qwen2AVDataCollator(processor,
-                                                     prompt_template=prompt_template,
-                                                     video_transform=VideoTransform(subset="train"),
-                                                     audio_transform=WavAudioTransform(subset="train",
-                                                                                       speech_dataset=interference_dataset),
-                                                     version=args.qwenav_version
-                                                     )
-        valid_av_data_collator = Qwen2AVDataCollator(processor,
-                                                     prompt_template=prompt_template,
-                                                     video_transform=VideoTransform(subset="train"),
-                                                     audio_transform=WavAudioTransform(subset="test"),
-                                                     version=args.qwenav_version
-                                                     )
+    prompt_template = "<|video_bos|><|VIDEO|><|video_eos|><|audio_bos|><|AUDIO|><|audio_eos|>Transcribe this speech:"
+    train_av_data_collator = AlvaDataCollator(processor,
+                                              prompt_template=prompt_template,
+                                              video_transform=VideoTransform(subset="train"),
+                                              audio_transform=WavAudioTransform(subset="train",
+                                                                                speech_dataset=interference_dataset),
+                                              text_transform=text_transform
+                                              )
+    valid_av_data_collator = AlvaDataCollator(processor,
+                                              prompt_template=prompt_template,
+                                              video_transform=VideoTransform(subset="train"),
+                                              audio_transform=WavAudioTransform(subset="test"),
+                                              text_transform=text_transform
+                                              )
 
     print("train_dataset\n", train_dataset)
     print("valid_dataset\n", valid_dataset)
@@ -536,7 +407,7 @@ if __name__ == "__main__":
         },
         disable_tqdm=args.no_progress_bar,
         # dispatch_batches=False
-        ddp_find_unused_parameters=True,  
+        ddp_find_unused_parameters=True,
         ignore_data_skip=True
     )
 

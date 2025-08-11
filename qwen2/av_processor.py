@@ -1,7 +1,7 @@
 import torch
 import numpy as np
 from torchcodec.decoders import VideoDecoder
-from transformers import AutoProcessor, AutoConfig, Qwen2AudioProcessor
+from transformers import AutoProcessor, AutoConfig, Qwen2AudioProcessor, ProcessorMixin
 from src.dataset.avhubert_dataset import AudioTransform, VideoTransform, load_audio, load_video
 from typing import List, Union
 
@@ -15,12 +15,24 @@ except ImportError:
     from typing_extensions import override  # Python <3.12
 import warnings
 
-from transformers.models.qwen2_audio.processing_qwen2_audio import Qwen2AudioProcessorKwargs
+from transformers.models.qwen2_audio.processing_qwen2_audio import ProcessingKwargs
 
-class Qwen2AudioVideoProcessor(Qwen2AudioProcessor):
-    valid_kwargs = ["chat_template",
-                    "audio_token", "audio_bos_token", "audio_eos_token",
+class Qwen2AVProcessorKwargs(ProcessingKwargs, total=False):
+    _defaults = {
+        "text_kwargs": {
+            "padding": False,
+        },
+        "audio_kwargs": {},
+        "video_kwargs": {}
+    }
+
+
+class Qwen2AVProcessor(ProcessorMixin):
+    attributes = ["feature_extractor", "tokenizer"]
+    valid_kwargs = ["chat_template", "audio_token", "audio_bos_token", "audio_eos_token",
                     "video_token", "video_bos_token", "video_eos_token"]
+    feature_extractor_class = "WhisperFeatureExtractor"
+    tokenizer_class = "AutoTokenizer"
 
     def __init__(
             self,
@@ -33,24 +45,34 @@ class Qwen2AudioVideoProcessor(Qwen2AudioProcessor):
             video_token="<|VIDEO|>",
             video_bos_token="<|video_bos|>",
             video_eos_token="<|video_eos|>",
+            debug=False
     ):
-        super().__init__(feature_extractor,
-                         tokenizer=tokenizer,
-                         chat_template=chat_template,
-                         audio_token=audio_token,
-                         audio_bos_token=audio_bos_token,
-                         audio_eos_token=audio_eos_token)
+        if chat_template is None:
+            chat_template = self.default_chat_template
+        self.audio_token = tokenizer.audio_token if hasattr(tokenizer, "audio_token") else audio_token
+        self.audio_token_id = tokenizer.convert_tokens_to_ids(self.audio_token)
+        self.audio_bos_token = tokenizer.audio_bos_token if hasattr(tokenizer, "audio_bos_token") else audio_bos_token
+        self.audio_eos_token = tokenizer.audio_eos_token if hasattr(tokenizer, "audio_eos_token") else audio_eos_token
 
         self.video_token = tokenizer.video_token if hasattr(tokenizer, "video_token") else video_token
         self.video_token_id = tokenizer.convert_tokens_to_ids(self.video_token)
         self.video_bos_token = tokenizer.video_bos_token if hasattr(tokenizer, "video_bos_token") else video_bos_token
         self.video_eos_token = tokenizer.video_eos_token if hasattr(tokenizer, "video_eos_token") else video_eos_token
 
+        super().__init__(feature_extractor, tokenizer, chat_template=chat_template)
+
         vocab = self.tokenizer.get_vocab()
 
-        for token in [self.video_token, self.video_bos_token, self.video_eos_token]:
+        for token in [self.audio_token, self.audio_bos_token, self.audio_eos_token,
+                      self.video_token, self.video_bos_token, self.video_eos_token]:
             assert token in vocab
 
+            if debug:
+                print(token, vocab[token])
+
+        self.debug = debug
+        # self.tokenizer.pad_token = self.tokenizer.eos_token
+        # self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
         self.tokenizer.padding_side = "left"
 
     def get_video_lengths(self, videos):
@@ -75,8 +97,7 @@ class Qwen2AudioVideoProcessor(Qwen2AudioProcessor):
             text: Union[TextInput, PreTokenizedInput, List[TextInput], List[PreTokenizedInput]] = None,
             audio: Union[np.ndarray, List[np.ndarray]] = None,
             video: Union[torch.Tensor, List[torch.Tensor]] = None,
-            audios=None,  # kept for BC
-            **kwargs: Unpack[Qwen2AudioProcessorKwargs],
+            **kwargs: Unpack[Qwen2AVProcessorKwargs],
     ) -> BatchFeature:
         """
         Main method to prepare for the model one or several sequences(s) and audio(s). This method forwards the `text`
@@ -94,15 +115,6 @@ class Qwen2AudioVideoProcessor(Qwen2AudioProcessor):
                 The audio or batch of audios to be prepared. Each audio can be a NumPy array.
         """
 
-        # Handle BC when user passes deprecated keyword argument
-        if audios is not None and audio is None:
-            audio = audios
-            warnings.warn(
-                "You may have used the keyword argument for the `audio` inputs. It is strongly recommended to pass inputs with keyword arguments "
-                "with keys `audio` and `text`. From transformers v4.55 `audio` will be the only acceptable keyword argument.",
-                FutureWarning,
-            )
-
         if text is None:
             raise ValueError("You need to specify `text` input to process.")
         elif isinstance(text, str):
@@ -111,7 +123,7 @@ class Qwen2AudioVideoProcessor(Qwen2AudioProcessor):
             raise ValueError("Invalid input text. Please provide a string, or a list of strings")
 
         output_kwargs = self._merge_kwargs(
-            Qwen2AudioProcessorKwargs,
+            Qwen2AVProcessorKwargs,
             tokenizer_init_kwargs=self.tokenizer.init_kwargs,
             **kwargs,
         )
@@ -187,6 +199,7 @@ class Qwen2AudioVideoProcessor(Qwen2AudioProcessor):
             # output_kwargs["audio_kwargs"]["padding"] = "max_length"
             # audio_inputs = self.feature_extractor(audio, **output_kwargs["audio_kwargs"])
             video_lengths = self.get_video_lengths(video)
+            # print("VIDEO LENGTHs", video_lengths)
 
             # rename attention_mask to prevent conflicts later on
             # audio_inputs["feature_attention_mask"] = audio_inputs.pop("attention_mask")
@@ -237,24 +250,77 @@ class Qwen2AudioVideoProcessor(Qwen2AudioProcessor):
 
         return BatchFeature(data={**inputs}, tensor_type=return_tensors)
 
-    @classmethod
-    def from_qwen2_processor(cls, processor, **kwargs):
+    def batch_decode(self, *args, **kwargs):
         """
-        Instantiate AudioVideoProcessor from an existing AudioProcessor.
+        This method forwards all its arguments to Qwen2TokenizerFast's [`~PreTrainedTokenizer.batch_decode`]. Please
+        refer to the docstring of this method for more information.
         """
-        feature_extractor = getattr(processor, "feature_extractor", None)
-        tokenizer = getattr(processor, "tokenizer", None)
-        chat_template = getattr(processor, "chat_template", None)
-        audio_token = getattr(processor, "audio_token", "<|AUDIO|>")
-        audio_bos_token = getattr(processor, "audio_bos_token", "<|audio_bos|>")
-        audio_eos_token = getattr(processor, "audio_eos_token", "<|audio_eos|>")
-        # Add any video kwargs from **kwargs or use defaults
-        return cls(
-            feature_extractor=feature_extractor,
-            tokenizer=tokenizer,
-            chat_template=chat_template,
-            audio_token=audio_token,
-            audio_bos_token=audio_bos_token,
-            audio_eos_token=audio_eos_token,
-            **kwargs
+        return self.tokenizer.batch_decode(*args, **kwargs)
+
+    def decode(self, *args, **kwargs):
+        """
+        This method forwards all its arguments to Qwen2TokenizerFast's [`~PreTrainedTokenizer.decode`]. Please refer to
+        the docstring of this method for more information.
+        """
+        return self.tokenizer.decode(*args, **kwargs)
+
+    @property
+    def model_input_names(self):
+        tokenizer_input_names = self.tokenizer.model_input_names
+        feature_extractor_input_names = self.feature_extractor.model_input_names
+        return list(dict.fromkeys(tokenizer_input_names + feature_extractor_input_names + ["feature_attention_mask"]))
+
+    @property
+    # NOTE: we don't have default templates anymore, and the below is kept only because the hub config is not yet updated!
+    def default_chat_template(self):
+        """
+        This default vicuna template formats inputs in the form of a chat history. For each message in the chat history:
+        * the template will output the role of the speaker followed by the content of the message.
+        * content is a list of strings and audios.
+        * If the content element is an audio, the template will output a sequence of <|AUDIO|> tokens
+
+        Example:
+
+        ```python
+        messages = [
+            {'role': 'system', 'content': 'You are a helpful assistant.'},
+            {"role": "user", "content": [
+                {"type": "audio", "audio_url": "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen2-Audio/audio/glass-breaking-151256.mp3"},
+                {"type": "text", "text": "What's that sound?"},
+            ]},
+            {"role": "assistant", "content": "It is the sound of glass shattering."},
+            {"role": "user", "content": [
+                {"type": "audio", "audio_url": "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen2-Audio/audio/f2641_0_throatclearing.wav"},
+                {"type": "text", "text": "How about this one?"},
+            ]},
+        ]
+
+        result = template.render(messages=messages, add_generation_prompt=True)
+        ```
+        """
+        # fmt: off
+        return (
+            "{% set audio_count = namespace(value=0) %}"
+            "{% for message in messages %}"
+            "{% if loop.first and message['role'] != 'system' %}"
+            "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+            "{% endif %}"
+            "<|im_start|>{{ message['role'] }}\n"
+            "{% if message['content'] is string %}"
+            "{{ message['content'] }}<|im_end|>\n"
+            "{% else %}"
+            "{% for content in message['content'] %}"
+            "{% if 'audio' in content or 'audio_url' in content or message['type'] == 'audio' %}"
+            "{% set audio_count.value = audio_count.value + 1 %}"
+            "Audio {{ audio_count.value }}: <|audio_bos|><|AUDIO|><|audio_eos|>\n"
+            "{% elif 'text' in content %}"
+            "{{ content['text'] }}"
+            "{% endif %}"
+            "{% endfor %}"
+            "<|im_end|>\n"
+            "{% endif %}"
+            "{% endfor %}"
+            "{% if add_generation_prompt %}"
+            "<|im_start|>assistant\n"
+            "{% endif %}"
         )

@@ -5,6 +5,10 @@ from peft import LoraModel, LoraConfig, get_peft_model
 from peft.tuners.lora import LoraLayer
 
 def load_sharded_state_dict(model_dir):
+    if os.path.exists(os.path.join(model_dir, "model.safetensors")):
+        state_dict = load_file(os.path.join(model_dir, "model.safetensors"))
+        return state_dict
+
     with open(os.path.join(model_dir, "model.safetensors.index.json")) as f:
         index = json.load(f)
     state_dict = {}
@@ -13,7 +17,7 @@ def load_sharded_state_dict(model_dir):
     return state_dict
 
 
-def create_lora(avsr_model):
+def create_lora(avsr_model, has_vision_tower=False):
     lora_target_modules = ["q_proj", "v_proj"]
 
     lora_config = LoraConfig(r=16, lora_alpha=64,
@@ -22,6 +26,10 @@ def create_lora(avsr_model):
 
     avsr_model.language_model.add_adapter(lora_config)
     avsr_model.audio_tower.add_adapter(lora_config)
+
+    if has_vision_tower:
+        for param in avsr_model.vision_tower.parameters():
+            param.requires_grad = False
 
     # avsr_model.language_model = get_peft_model(avsr_model.language_model, lora_config)
     # avsr_model.audio_tower = get_peft_model(avsr_model.audio_tower, lora_config)
@@ -40,7 +48,7 @@ def merge_lora(avsr_model):
                     submodule.merge()
 
     recursively_merge_lora_layers(avsr_model.language_model)
-    recursively_merge_lora_layers(avsr_model.audio_tower)f
+    recursively_merge_lora_layers(avsr_model.audio_tower)
 
     return avsr_model
 

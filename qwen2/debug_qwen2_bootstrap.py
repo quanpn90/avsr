@@ -2,38 +2,26 @@ import datasets
 import torch
 from transformers import Qwen2AudioProcessor
 
-from qwen2.av_processor import Qwen2AudioVideoProcessor
-from qwen2.qwen2avconfig import Qwen2AudioVideoConfig, Qwen2AudioConfig, AVHubertAVSRConfig
+from qwen2.av_processor import Qwen2AVProcessor
+from qwen2.qwen2avconfig import Qwen2AVConfig, Qwen2AudioConfig, AVHubertAVSRConfig
 from src.dataset.avhubert_dataset import load_audio, load_video
 
 default_qwen2 = "Qwen/Qwen2-Audio-7B"
 cache_dir = "data-bin/cache"
 
 qwen2audio_config = Qwen2AudioConfig.from_pretrained(default_qwen2, cache_dir=cache_dir)
-
 vocab_size = qwen2audio_config.text_config.vocab_size
 avhubert_config = AVHubertAVSRConfig(odim=vocab_size)
 
-qwen2av_config = Qwen2AudioVideoConfig(qwen2audio_config=qwen2audio_config, avhubert_config=avhubert_config)
+qwen2av_config = Qwen2AVConfig(avhubert_config=avhubert_config)
 
-processor = Qwen2AudioProcessor.from_pretrained(default_qwen2, trust_remote_code=True)
-tokenizer = processor.tokenizer
+q2_processor = Qwen2AudioProcessor.from_pretrained(default_qwen2, trust_remote_code=True)
+tokenizer = q2_processor.tokenizer
 
 tokenizer.add_tokens(["<|VIDEO|>"])
 tokenizer.add_tokens(["<|video_bos|>"])
 tokenizer.add_tokens(["<|video_eos|>"])
 
-new_processor = Qwen2AudioVideoProcessor.from_qwen2_processor(processor)
-
-tokenizer = new_processor.tokenizer
-
-vocab = tokenizer.get_vocab()
-
-for token in ["<|AUDIO|>", "<|audio_bos|>", "<|audio_eos|>", "<|VIDEO|>", "<|video_bos|>", "<|video_eos|>", "<|en|>"]:
-    if token in vocab:
-        print("%s exists in the vocabulary!: %d" % (token, vocab[token]))
-    else:
-        print("%s does NOT exist in the vocabulary." % token)
 
 print(tokenizer.eos_token)
 print(tokenizer.eos_token_id)
@@ -41,6 +29,10 @@ print(tokenizer.bos_token)
 print(tokenizer.bos_token_id)
 print(tokenizer.pad_token)
 print(tokenizer.pad_token_id)
+
+processor = Qwen2AVProcessor(feature_extractor=q2_processor.feature_extractor,
+                             tokenizer=q2_processor.tokenizer, debug=True)
+
 
 print("Processor initialized successfully!")
 #
@@ -72,6 +64,8 @@ video2 = load_video(video_array2)
 text2 = prompt_template + "<|en|>" + text2.lower() + tokenizer.eos_token
 
 
+print(video.size())
+print(video2.size())
 inputs = processor(text=[text, text2], audio=[audio, audio2], video=[video, video2],
                    return_tensors="pt", padding=True)
 
@@ -86,17 +80,20 @@ print("processor saved successfully!!")
 # now we create the model
 
 
-from transformers.models.qwen2_audio.modeling_qwen2_audio import (Qwen2AudioForConditionalGeneration)
-from qwen2.qwen2avmodel import MemoryEfficientQwen2AVLM
+from transformers import Qwen2AudioForConditionalGeneration
+#
+
+torch_dtype = torch.bfloat16
 
 model = Qwen2AudioForConditionalGeneration.from_pretrained("Qwen/Qwen2-Audio-7B",
-                                                           cache_dir=cache_dir)
+                                                           device_map="cuda:0", cache_dir=cache_dir,
+                                                           torch_dtype=torch_dtype)
 
 print(model.get_input_embeddings().weight)
 print(model.language_model.lm_head.weight)
 
 embedding_size = model.language_model.model.embed_tokens.weight.size(0)
-model.resize_token_embeddings(embedding_size + 3)
+model.resize_token_embeddings(embedding_size + 3, mean_resizing=False)
 
 video_ids = [154931, 154932, 154933]
 audio_ids = [151646, 151647, 151648]
@@ -110,9 +107,11 @@ with torch.no_grad():
 
 qwen2av_config.text_config.vocab_size += 3
 
+from qwen2.qwen2avmodel import MemoryEfficientQwen2AVLM
 model_class = MemoryEfficientQwen2AVLM
 
 avmodel = model_class(qwen2av_config)
+avmodel = avmodel.to(torch_dtype).cuda()
 
 avmodel.load_pretrained_avhubert(cache_dir=cache_dir)
 

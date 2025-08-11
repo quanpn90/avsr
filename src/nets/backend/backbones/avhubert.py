@@ -460,6 +460,62 @@ class AVHubertModel(PreTrainedModel):
         logits = logits / self.logit_temp
         return logits
 
+    def forward_av_features(
+            self,
+            audio_features: torch.Tensor,
+            video_features: torch.Tensor,
+            padding_mask: Optional[torch.Tensor] = None,
+            mask: bool = True,
+            # features_only: bool = False,
+            # output_layer: Optional[int] = None,
+            # video: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """output layer is 1-based"""
+
+        if self.modality == 'audio':
+            video_features = 0 * video_features
+        elif self.modality == 'video':
+            audio_features = 0 * audio_features
+        else:
+            if self.training:
+                modality_drop_prob, audio_drop_prob = np.random.random(), np.random.random()
+                if modality_drop_prob < self.modality_dropout:
+                    if audio_drop_prob < self.audio_dropout:
+                        audio_features = 0 * audio_features
+                    else:
+                        video_features = 0 * video_features
+
+        if self.modality_fuse == 'concat':
+            features = torch.cat([audio_features, video_features], dim=2)
+        elif self.modality_fuse == 'add':
+            features = audio_features + video_features
+
+        # why?
+        # features_pen = features.float().pow(2).mean()
+        features = self.layer_norm(features)
+
+        # if padding_mask is not None:
+        #     padding_mask = self.forward_padding_mask(features, padding_mask)
+
+        if self.post_extract_proj is not None:
+            features = self.post_extract_proj(features)
+
+        features = self.dropout_input(features)
+        if self.masking_type == 'feature' and mask:
+            x, mask_indices = self.apply_feature_mask(features, padding_mask, None)
+        else:
+            x = features
+
+        # feature: (B, T, D), float
+        # target: (B, T), long
+        # x: (B, T, D), float
+        # padding_mask: (B, T), bool
+        # mask_indices: (B, T), bool
+
+        x = self.encoder(x, attention_mask=padding_mask)[0]
+
+        return x
+
     def forward_gen(
             self,
             source: torch.Tensor,

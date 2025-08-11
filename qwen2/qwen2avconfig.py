@@ -1,7 +1,5 @@
-from qwen2.qwen2model import MemoryEfficientQwen2AudioLM, Qwen2AudioConfig
-from transformers.models.qwen2_audio.configuration_qwen2_audio import (PretrainedConfig,
-                                                                       AutoConfig,
-                                                                       CONFIG_MAPPING)
+# from qwen2.qwen2model import MemoryEfficientQwen2AudioLM, Qwen2AudioConfig
+from transformers import PretrainedConfig, Qwen2Config, Qwen2AudioConfig, AutoConfig, Qwen2AudioEncoderConfig
 
 from src.avhubert_avsr.configuration_avhubert_avsr import AVHubertAVSRConfig
 import json
@@ -9,13 +7,14 @@ import json
 default_qwen2 = "Qwen/Qwen2-Audio-7B"
 
 
-class Qwen2AudioVideoConfig(PretrainedConfig):
+class Qwen2AVConfig(PretrainedConfig):
     model_type = "qwen2_av"
     attribute_map = {
         "audio_token_id": "audio_token_index",
         "video_token_id": "video_token_index",
     }
-    sub_configs = {"qwen2audio_config": Qwen2AudioConfig, "avhubert_config": AVHubertAVSRConfig}
+    sub_configs = {"text_config": Qwen2Config, "audio_config": Qwen2AudioEncoderConfig,
+                   "avhubert_config": AVHubertAVSRConfig}
 
     qwen_audio_mask_prob: float = 0.0
     avhubert_audio_mask_prob: float = 0.0
@@ -26,11 +25,14 @@ class Qwen2AudioVideoConfig(PretrainedConfig):
     video_token_index = 154931
     audio_token_index = 151646
 
+    pad_token_id = 151643
+    eos_token_id = 151645
+
     def __init__(
             self,
-            qwen2audio_config=None,
+            text_config=None,
+            audio_config=None,
             avhubert_config=None,
-            video_token_index=154931,
             whisper_encoder_mask_prob=0.0,
             avhubert_audio_mask_prob=0.0,
             finetune_avhubert: bool = False,
@@ -39,15 +41,29 @@ class Qwen2AudioVideoConfig(PretrainedConfig):
             **kwargs,
     ):
         # self.video_token_index = video_token_index
+        _default_qwen2audio_config = Qwen2AudioConfig.from_pretrained(default_qwen2)
 
         # Ensure sub-configs are config objects, not dicts
-        if isinstance(qwen2audio_config, dict):
-            qwen2audio_config["model_type"] = qwen2audio_config.get("model_type", "qwen2_audio")
-            qwen2audio_config = Qwen2AudioConfig(**qwen2audio_config)
-        elif qwen2audio_config is None:
-            qwen2audio_config = Qwen2AudioConfig.from_pretrained(default_qwen2)
+        if isinstance(audio_config, dict):
+            audio_config["model_type"] = (
+                audio_config["model_type"] if "model_type" in audio_config else "qwen2_audio_encoder"
+            )
+            audio_config = Qwen2AudioEncoderConfig(**audio_config)
+        elif audio_config is None:
 
-        self.qwen2audio_config = qwen2audio_config
+            # maybe set the default to be Whisper Large v3
+            audio_config = _default_qwen2audio_config.audio_config
+        self.audio_config = audio_config
+
+        if isinstance(text_config, dict):
+            text_config["model_type"] = (
+                text_config["model_type"] if "model_type" in text_config else "qwen2"
+            )
+            text_config = Qwen2Config(**text_config)
+        elif text_config is None:
+            text_config = _default_qwen2audio_config.text_config
+
+        self.text_config = text_config
 
         if isinstance(avhubert_config, dict):
             avhubert_config["model_type"] = avhubert_config.get("model_type", "avhubert_avsr")
@@ -64,34 +80,7 @@ class Qwen2AudioVideoConfig(PretrainedConfig):
         self.finetune_qwen2audio = finetune_qwen2audio
         self.finetune_avhubert = finetune_avhubert
 
-        self.text_config = self.qwen2audio_config.text_config if self.qwen2audio_config is not None else None
-        self.audio_config = self.qwen2audio_config.audio_config if self.qwen2audio_config is not None else None
-        self.audio_token_index = self.qwen2audio_config.audio_token_index if self.qwen2audio_config is not None else None
-
         super().__init__(**kwargs)
 
-    # @property
-    # def text_config(self):
-    #     return self.qwen2audio_config.text_config
-    #
-    # @text_config.setter
-    # def text_config(self, value):
-    #     self.qwen2audio_config.text_config = value
-    #
-    # @property
-    # def audio_config(self):
-    #     return self.qwen2audio_config.audio_config
-    #
-    # @audio_config.setter
-    # def audio_config(self, value):
-    #     self.qwen2audio_config.audio_config = value
-    #
-    # @property
-    # def audio_token_index(self):
-    #     return self.qwen2audio_config.audio_token_index
-    #
-    # @audio_token_index.setter
-    # def audio_token_index(self, value):
-    #     self.qwen2audio_config.audio_token_index = value
 
-AutoConfig.register("qwen2_av", Qwen2AudioVideoConfig)
+AutoConfig.register("qwen2_av", Qwen2AVConfig)

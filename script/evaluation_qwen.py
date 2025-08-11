@@ -33,6 +33,8 @@ from src.cluster.conv_spks import (
     get_clustering_f1_score
 )
 
+torch.set_printoptions(threshold=float('inf'))
+
 
 class BaseInferenceModel(ABC):
     """Abstract base class for all inference models"""
@@ -200,62 +202,62 @@ class Qwen2AudioModel(BaseInferenceModel):
 class Qwen2AVModel(BaseInferenceModel):
     """AVSR Cocktail model implementation"""
 
-    version = 1.0
+    version = 2.0
 
     def load_model(self):
-        from qwen2.qwen2avconfig import Qwen2AudioVideoConfig, Qwen2AudioConfig
+        from qwen2.qwen2avconfig import Qwen2AVConfig, Qwen2AudioConfig
         from src.avhubert_avsr.configuration_avhubert_avsr import AVHubertAVSRConfig
         from qwen2.qwen2avmodel import create_qwen2av_model
 
         from transformers import PreTrainedModel
         from src.dataset.qwen_av_dataset import WavAudioTransform, Qwen2AVEvalCollator
         from src.dataset.avhubert_dataset import VideoTransform
-        from qwen2.av_processor import Qwen2AudioVideoProcessor
+        from qwen2.av_processor import Qwen2AVProcessor
         from script.train_util import load_sharded_state_dict, create_lora, merge_lora
         from script.train_qwen import skip_check_and_enable_flash_attn_2
         PreTrainedModel._check_and_enable_flash_attn_2 = classmethod(skip_check_and_enable_flash_attn_2)
 
         attention_type = "flash_attention_2"
-        qwenav_prototype = "./qwenav-prototype"
-        qwenav_base = "./qwenav_base"
+        prototype_path = "./qwen2av_base/"
 
-        processor = Qwen2AudioVideoProcessor.from_pretrained(qwenav_base, trust_remote_code=True)
+        processor = Qwen2AVProcessor.from_pretrained(prototype_path, trust_remote_code=True)
 
-        # config = Qwen2AudioVideoConfig.from_pretrained(self.checkpoint_path)
-        qwen2audio_config = Qwen2AudioConfig.from_pretrained(qwenav_base)
-        qwen2audio_config._attn_implementation = "flash_attention_2"
-        avhubert_config = AVHubertAVSRConfig(odim=qwen2audio_config.vocab_size,
-                                             attn_implementation=attention_type)
-        avhubert_config._attn_implementation = "flash_attention_2"
-
-        config = Qwen2AudioVideoConfig(qwen2audio_config=qwen2audio_config,
-                                       avhubert_config=avhubert_config)
+        config = Qwen2AVConfig.from_pretrained(prototype_path)
+        print(config)
         config._attn_implementation = "flash_attention_2"
         torch_dtype = self.dtype
         device = torch.device(f"cuda:{self.worker_id}")
 
         # Load text transform
-        avsr_model = create_qwen2av_model("", config,
+        avsr_model = create_qwen2av_model(prototype_path, config,
                                           torch_dtype=torch_dtype,
                                           attn_implementation=attention_type, device_map={"": device},
                                           create_if_missing=True)
+
+        # avsr_model.config = config
 
         avsr_model = create_lora(avsr_model)
 
         model_path = self.checkpoint_path
         state_dict = load_sharded_state_dict(model_path)
-        avsr_model.load_state_dict(state_dict)
+        avsr_model.load_state_dict(state_dict, strict=True)
+
+        print("[INFO] Loaded model weights from %s" % model_path)
 
         avsr_model = merge_lora(avsr_model)
+
+        # avsr_model.config = config
+        # print(type(config.get_text_config()))
+        # breakpoint()
+        # if isinstance(config.text_config, dict):
+        #     from transformers import Qwen2Config
+        #     config.text_config = Qwen2Config(**config.text_config)
 
         # # Load data collator
         audio_transform = WavAudioTransform(subset="test")
         video_transform = VideoTransform(subset="test")
 
-        if self.version == 1.0:
-            prompt_template = "<|video_bos|><|VIDEO|><|video_eos|> <|audio_bos|><|AUDIO|><|audio_eos|> Transcribe this speech:"
-        else:
-            prompt_template = "<|video_bos|><|VIDEO|><|video_eos|><|audio_bos|><|AUDIO|><|audio_eos|>Transcribe this speech:"
+        prompt_template = "<|video_bos|><|VIDEO|><|video_eos|><|audio_bos|><|AUDIO|><|audio_eos|>Transcribe this speech:"
         #
         self.av_data_collator = Qwen2AVEvalCollator(
             processor,
@@ -281,29 +283,33 @@ class Qwen2AVModel(BaseInferenceModel):
         # nbest_hyps = [h.asdict() for h in nbest_hyps[:min(len(nbest_hyps), 1)]]
         # predicted_token_id = torch.tensor(list(map(int, nbest_hyps[0]["yseq"][1:])))
         # predicted = self.text_transform.post_process(predicted_token_id).replace("<eos>", "")
+        print("input_ids", inputs["input_ids"])
 
-        eos_id = self.av_data_collator.eos_token_id
         processor = self.processor
+        eos_token_id = self.processor.tokenizer.eos_token_id
+        pad_token_id = self.processor.tokenizer.pad_token_id
+        print("EOS token_id", eos_token_id)
         generated_ids = self.model.generate(
             **inputs,
-            max_length=1024,
+            max_length=inputs["input_ids"].size(1) + 100,
             num_beams=self.beam_size,
             no_repeat_ngram_size=self.no_repeat_ngram_size,
             # repetition_penalty=1.2,
             # length_penalty=0.9,
             early_stopping=True,
-            pad_token_id=self.processor.tokenizer.pad_token_id,
-            eos_token_id=eos_id
-            # 🔥 Remove top_k / top_p when not sampling
-            # top_k=0,
-            # top_p=0.01,
+            eos_token_id=eos_token_id,
+            pad_token_id=pad_token_id,
         )
+
+        # print(generated_ids)
 
         # Remove prompt tokens
         prompt_lens = inputs["input_ids"].ne(processor.tokenizer.pad_token_id).sum(dim=1)
         clean_outputs = [
             gen_ids[prompt_len:] for gen_ids, prompt_len in zip(generated_ids, prompt_lens)
         ]
+
+        print(clean_outputs)
 
         responses = processor.batch_decode(
             clean_outputs,
@@ -382,6 +388,7 @@ class Llama3AVModel(BaseInferenceModel):
         avsr_model = create_lora(avsr_model)
 
         model_path = self.checkpoint_path
+
         state_dict = load_sharded_state_dict(model_path)
         avsr_model.load_state_dict(state_dict)
 
@@ -441,7 +448,7 @@ class Llama3AVModel(BaseInferenceModel):
             gen_ids[prompt_len:] for gen_ids, prompt_len in zip(generated_ids, prompt_lens)
         ]
 
-        print("\n", "[OUTPUT IDS]", clean_outputs)
+        # print("\n", "[OUTPUT IDS]", clean_outputs)
 
         responses = processor.batch_decode(
             clean_outputs,
@@ -791,6 +798,69 @@ def eval_avcocktail(engine, video_dataset, label_dataset, set_name=None):
             seg_end_time = float(str(sample['end_time'], encoding='utf-8'))
             if seg_start_time + 1 < start_time or seg_end_time - 1 > end_time:
                 continue
+            output = engine.infer_processed_sample(sample['video'])[0]
+            output_list.append(output)
+            output_list_start_time.append(seg_start_time)
+
+            temp_output_text = norm_string(output.replace("<unk>", ""))
+            # print("[OUT]", temp_output_text)
+        # output_list = [output for _, output in sorted(zip(output_list_start_time, output_list))][0]
+        # print(output_list)
+        output_text = norm_string(" ".join(output_list).replace("<unk>", ""))
+
+        # print("[REF]", label_text)
+        # print("[HYP]", output_text)
+        spk_wer = wer(reference=label_text, hypothesis=output_text)
+        wer_scores[chunk_type] = spk_wer
+    return wer_scores, len(label_text.split())
+
+
+def _eval_avcocktail_single_thread(args, video_dataset, label_dataset, worker_id, result_queue, set_name=None):
+    engine = InferenceEngine(args.model_type, args.checkpoint_path,
+                             args.cache_dir, args.beam_size, args.max_length,
+                             worker_id=worker_id)
+    engine.load_model()
+
+
+    wer_scores = {}
+    # Process label
+    label_list = []
+    label_start_time = []
+    start_time = None
+    end_time = None
+    with tempfile.NamedTemporaryFile(suffix=".vtt") as temp_file:
+        with open(temp_file.name, "w") as f:
+            f.write(str(label_dataset['label'][0], encoding='utf-8'))
+        for utt_id, caption in enumerate(webvtt.read(temp_file.name)):
+            if caption.text == "":
+                continue
+            label_list.append(caption.text)
+            caption_start_time = caption.start_time.hours * 3600 + caption.start_time.minutes * 60 + caption.start_time.seconds + caption.start_time.milliseconds / 1000
+            caption_end_time = caption.end_time.hours * 3600 + caption.end_time.minutes * 60 + caption.end_time.seconds + caption.end_time.milliseconds / 1000
+            if start_time is None:
+                start_time = caption_start_time
+            if end_time is None:
+                end_time = caption_end_time
+            if caption_start_time < start_time:
+                start_time = caption_start_time
+            if caption_end_time > end_time:
+                end_time = caption_end_time
+            label_start_time.append(caption_start_time)
+        # sort label list by start time
+        label_list = [label for _, label in sorted(zip(label_start_time, label_list))]
+        label_text = norm_string(" ".join(label_list))
+
+    for chunk_type in ['asd_chunk', 'fixed_chunk', 'gold_chunk']:
+        # Process video
+        output_list = []
+        output_list_start_time = []
+        for sample in tqdm(video_dataset[chunk_type], desc=f"Processing {chunk_type} {set_name}",
+                           total=len(video_dataset[chunk_type])):
+            # for seg_path in list_segments:
+            seg_start_time = float(str(sample['start_time'], encoding='utf-8'))
+            seg_end_time = float(str(sample['end_time'], encoding='utf-8'))
+            if seg_start_time + 1 < start_time or seg_end_time - 1 > end_time:
+                continue
             output = engine.infer_processed_sample(sample['video'])
             output_list.append(output)
             output_list_start_time.append(seg_start_time)
@@ -909,7 +979,9 @@ def main():
             wer_score = eval_lrs2(args, dataset)
             print(f"WER: {wer_score}")
     elif args.dataset_name == 'AVCocktail':
-        engine = InferenceEngine(args.model_type, args.checkpoint_path, args.cache_dir, args.beam_size, args.max_length)
+        engine = InferenceEngine(args.model_type, args.checkpoint_path,
+                                 args.cache_dir, args.beam_size, args.max_length,
+                                 worker_id=0)
         engine.load_model()
 
         if args.set_id not in [f'video_{i}' for i in range(0, 51)] + ['*']:
@@ -931,10 +1003,6 @@ def main():
             for chunk_type, wer_scores in list_wer_scores.items():
                 print(f"Average WER {chunk_type}: {sum(wer_scores) / len(wer_scores):.4f}")
         else:
-            engine = InferenceEngine(args.model_type, args.checkpoint_path, args.cache_dir, args.beam_size,
-                                     args.max_length)
-            engine.load_model()
-
             print(f"Inferring {args.dataset_name}/{args.set_id} sessions using {args.model_type} model")
             video_dataset = datasets.load_dataset("nguyenvulebinh/AVCocktail", args.set_id,
                                                   cache_dir='./data-bin/cache')

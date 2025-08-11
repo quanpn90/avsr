@@ -1,50 +1,102 @@
 import os
-import torch
-import torch.nn.functional as F
-import torch.nn as nn
-from typing import Optional, Tuple, Union, Dict
-from transformers.cache_utils import Cache
-from transformers import Qwen2AudioForConditionalGeneration
-
 from contextlib import nullcontext
+from typing import Optional, Tuple, Union
 
-from qwen2.qwen2model import (MemoryEfficientQwen2AudioLM, Qwen2AudioConfig, Qwen2AudioCausalLMOutputWithPast,
-                              BayesianQwen2AudioCausalLMOutputWithPast, fast_xentropy, softmax_xentropy)
-from src.nets.backend.backbones.avhubert import AVHubertModel
-from src.avhubert_avsr.configuration_avhubert_avsr import AVHubertAVSRConfig
-from src.nets.backend.nets_utils import make_non_pad_mask
-
-from qwen2.qwen2avconfig import Qwen2AudioVideoConfig
+import torch
+import torch.nn as nn
 from transformers import AutoModel
-
+from transformers import Qwen2AudioForConditionalGeneration, Qwen2ForCausalLM
+from transformers import Qwen2AudioPreTrainedModel, GenerationMixin, PreTrainedModel
+from transformers.cache_utils import Cache
+from transformers.modeling_outputs import (
+    BaseModelOutputWithPast,
+    CausalLMOutputWithPast,
+)
+from transformers.models.qwen2_audio.modeling_qwen2_audio import Qwen2AudioMultiModalProjector
 from transformers.utils import logging
 
+from qwen2.qwen2avconfig import Qwen2AVConfig
+from qwen2.qwen2model import (Qwen2AudioCausalLMOutputWithPast,
+                              BayesianQwen2AudioCausalLMOutputWithPast, softmax_xentropy)
+from src.nets.backend.backbones.avhubert import AVHubertModel
+from src.nets.backend.nets_utils import make_non_pad_mask
+
 logger = logging.get_logger(__name__)
+torch.set_printoptions(threshold=float('inf'))
 
 
-class MemoryEfficientQwen2AVLM(MemoryEfficientQwen2AudioLM):
-    config_class = Qwen2AudioVideoConfig
+class Qwen2AVPreTrainedModel(PreTrainedModel):
+    config_class = Qwen2AVConfig
+    base_model_prefix = "model"
+    supports_gradient_checkpointing = True
+    _no_split_modules = ["Qwen2AudioAttention"]
+    _skip_keys_device_placement = "past_key_values"
+    _supports_flash_attn_2 = True
+    _supports_sdpa = True
+
+    freeze_audio_encoder = False
+    freeze_av_encoder = False
+    label_smoothing = 0.0
+
+    def _init_weights(self, module):
+        # important: this ported version of Qwen2Audio isn't meant for training from scratch - only
+        # inference and fine-tuning - so the proper init weights code has been removed
+        std = (
+            self.config.initializer_range
+            if hasattr(self.config, "initializer_range")
+            else self.config.audio_config.initializer_range
+        )
+
+        if isinstance(module, (nn.Linear, nn.Conv1d)):
+            module.weight.data.normal_(mean=0.0, std=std)
+            if module.bias is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, nn.Embedding):
+            module.weight.data.normal_(mean=0.0, std=std)
+            if module.padding_idx is not None:
+                module.weight.data[module.padding_idx].zero_()
+
+
+# class MemoryEfficientQwen2AVLM(MemoryEfficientQwen2AudioLM):
+class MemoryEfficientQwen2AVLM(Qwen2AVPreTrainedModel, GenerationMixin):
+    config_class = Qwen2AVConfig
     whisper_encoder_mask_prob = 0.0
     avhubert_encoder_mask_prob = 0.0
 
-    def __init__(self, config: Qwen2AudioVideoConfig):
-        # first we create audio encoder and language model
-        super().__init__(config.qwen2audio_config)
+    def __init__(self, config: Qwen2AVConfig):
+        super().__init__(config)
         self.config = config
 
-        # next we create avhubert encoder
-        # always drop audio, video is never dropped
+        # Whisper
+        self.audio_tower = MemoryOptimizedQwen2AudioEncoder(config.audio_config)
+        self.multi_modal_projector = Qwen2AudioMultiModalProjector(config)
+
+        # Llama Config
+        self.vocab_size = config.text_config.vocab_size
+        self.language_model = Qwen2ForCausalLM(config.text_config)
+        if self.language_model._tied_weights_keys is not None:
+            self._tied_weights_keys = [f"language_model.{k}" for k in self.language_model._tied_weights_keys]
+
         config.avhubert_config.audio_dropout = 1.0
         config.avhubert_config.modality_dropout = config.avhubert_audio_mask_prob
+
+        # hardcode?
+        config.avhubert_config._attn_implementation = "flash_attention_2"
         self.avhubert_encoder = AVHubertModel(config.avhubert_config)
-        self.freeze_av_encoder = False
 
         # finally create the link between avencoder and language model
         video_embed_size = self.avhubert_encoder.encoder_embed_dim
 
         self.video_feature_projector = nn.Linear(video_embed_size,
-                                                 self.config.qwen2audio_config.text_config.hidden_size,
+                                                 self.config.text_config.hidden_size,
                                                  bias=True)
+
+        # self.pad_token_id = self.config.pad_token_id if self.config.pad_token_id is not None else -1
+
+        # hard code the pad token id :)
+        self.pad_token_id = 151643
+        self._padding_side = "left"  # set it to left by default, user can use setter to change padding_sides
+        self.post_init()
 
     def set_audio_mask(self, args):
 
@@ -63,9 +115,12 @@ class MemoryEfficientQwen2AVLM(MemoryEfficientQwen2AudioLM):
                                  encoder_pretrained_checkpoint="nguyenvulebinh/avhubert_encoder_large_noise_pt_noise_ft_433h",
                                  cache_dir="model-bin/cache"):
         print("Loading pretrained encoder from", encoder_pretrained_checkpoint)
+
+        device_map = "cuda:0"
         encoder_pretrained = self.avhubert_encoder.from_pretrained(
             encoder_pretrained_checkpoint,
             cache_dir=cache_dir,
+            device_map=device_map
         )
 
         self.avhubert_encoder.load_state_dict(encoder_pretrained.state_dict())
@@ -74,11 +129,83 @@ class MemoryEfficientQwen2AVLM(MemoryEfficientQwen2AudioLM):
                                    model_name="Qwen/Qwen2-Audio-7B",
                                    cache_dir="model-bin/cache"):
 
-        pretrained_qwen2audio = Qwen2AudioForConditionalGeneration.from_pretrained(model_name, cache_dir=cache_dir)
+        pretrained_qwen2audio = Qwen2AudioForConditionalGeneration.from_pretrained(model_name,
+                                                                                   cache_dir=cache_dir,
+                                                                                   device_map=device_map)
 
         self.audio_tower.load_state_dict(pretrained_qwen2audio.audio_tower.state_dict())
         self.language_model.load_state_dict(pretrained_qwen2audio.language_model.state_dict())
         self.multi_modal_projector.load_state_dict(pretrained_qwen2audio.multi_modal_projector.state_dict())
+
+    @property
+    def padding_side(self):
+        return self._padding_side
+
+    @padding_side.setter
+    def padding_side(self, padding_side: str):
+        if padding_side not in ["left", "right"]:
+            raise ValueError(f"{padding_side} is not `left` or `right`.")
+        self._padding_side = padding_side
+
+    def get_input_embeddings(self):
+        return self.language_model.get_input_embeddings()
+
+    def set_input_embeddings(self, value):
+        self.language_model.set_input_embeddings(value)
+
+    def get_output_embeddings(self):
+        return self.language_model.get_output_embeddings()
+
+    def set_output_embeddings(self, new_embeddings):
+        self.language_model.set_output_embeddings(new_embeddings)
+
+    def set_decoder(self, decoder):
+        self.language_model.set_decoder(decoder)
+
+    def get_decoder(self):
+        return self.language_model.get_decoder()
+
+    def forward_lm(self, attention_mask, position_ids, past_key_values,
+                   inputs_embeds, use_cache, output_attentions, output_hidden_states, return_dict):
+
+        # outputs = self.language_model(
+        #     attention_mask=attention_mask,
+        #     position_ids=position_ids,
+        #     past_key_values=past_key_values,
+        #     inputs_embeds=inputs_embeds,
+        #     use_cache=use_cache,
+        #     output_attentions=output_attentions,
+        #     output_hidden_states=output_hidden_states,
+        #     return_dict=return_dict,
+        # )
+
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+
+        # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
+        outputs: BaseModelOutputWithPast = self.language_model.model(
+            input_ids=None,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            cache_position=None
+        )
+
+        hidden_states = outputs.last_hidden_state
+
+        return CausalLMOutputWithPast(
+            loss=None,
+            logits=hidden_states,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
 
     def forward(
             self,
@@ -140,6 +267,10 @@ class MemoryEfficientQwen2AVLM(MemoryEfficientQwen2AudioLM):
         >>> processor.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
         "Generate the caption in English: Glass is breaking."
         ```"""
+
+        # print(input_ids)
+        # print(labels)
+
         if not hasattr(self.config, "audio_token_id"):
             self.config.audio_token_id = self.config.audio_token_index
 
@@ -239,42 +370,38 @@ class MemoryEfficientQwen2AVLM(MemoryEfficientQwen2AudioLM):
 
             # 3. merge text/audio and videos
             if videos is not None and input_ids.shape[1] != 1:
-                context = torch.no_grad() if self.freeze_av_encoder else nullcontext()
-                with context:
+                # this is imported from the avsr lib
+                av_padding_mask = make_non_pad_mask(video_lengths).to(videos.device)
+                # attention_mask =
+                avhubert_features = self.avhubert_encoder(
+                    input_features=audios,
+                    video=videos,
+                    attention_mask=av_padding_mask
+                )
 
-                    # TODO: import make_non_pad_mask
-                    av_padding_mask = make_non_pad_mask(video_lengths).to(videos.device)
-                    # attention_mask =
-                    avhubert_features = self.avhubert_encoder(
-                        input_features=audios,
-                        video=videos,
-                        attention_mask=av_padding_mask
+                selected_video_feature = avhubert_features.last_hidden_state
+
+                video_features = self.video_feature_projector(selected_video_feature)
+
+                # if we have consecutive audio tokens, then it means we expanded input_ids in processing
+                # video_tokens = input_ids == self.config.video_token_id
+
+                num_videos, max_video_tokens, embed_dim = video_features.shape
+                video_features_mask = torch.arange(max_video_tokens, device=audio_output_lengths.device)[None, :]
+                video_features_mask = video_features_mask < video_lengths[:, None]
+                video_features = video_features[video_features_mask]
+
+                n_video_tokens = (input_ids == self.config.video_token_id).sum().item()
+                n_video_features = video_features.shape[0]
+
+                if n_video_tokens != n_video_features:
+                    raise ValueError(
+                        f"Video features and video tokens do not match: tokens: {n_video_tokens}, features {n_video_features}"
                     )
-
-                    selected_video_feature = avhubert_features.last_hidden_state
-
-                    video_features = self.video_feature_projector(selected_video_feature)
-
-                    # if we have consecutive audio tokens, then it means we expanded input_ids in processing
-                    # video_tokens = input_ids == self.config.video_token_id
-
-                    num_videos, max_video_tokens, embed_dim = video_features.shape
-                    video_features_mask = torch.arange(max_video_tokens, device=audio_output_lengths.device)[None, :]
-                    # print(video_features_mask.size(), video_lengths.size())
-                    video_features_mask = video_features_mask < video_lengths[:, None]
-                    video_features = video_features[video_features_mask]
-
-                    n_video_tokens = (input_ids == self.config.video_token_id).sum().item()
-                    n_video_features = video_features.shape[0]
-
-                    if n_video_tokens != n_video_features:
-                        raise ValueError(
-                            f"Video features and video tokens do not match: tokens: {n_video_tokens}, features {n_video_features}"
-                        )
-                    special_video_mask = (input_ids == self.config.video_token_id).to(inputs_embeds.device)
-                    special_video_mask = special_video_mask.unsqueeze(-1).expand_as(inputs_embeds)
-                    video_features = video_features.to(inputs_embeds.device, inputs_embeds.dtype)
-                    inputs_embeds = inputs_embeds.masked_scatter(special_video_mask, video_features)
+                special_video_mask = (input_ids == self.config.video_token_id).to(inputs_embeds.device)
+                special_video_mask = special_video_mask.unsqueeze(-1).expand_as(inputs_embeds)
+                video_features = video_features.to(inputs_embeds.device, inputs_embeds.dtype)
+                inputs_embeds = inputs_embeds.masked_scatter(special_video_mask, video_features)
 
         #     else:
         #         print("Ignore video", input_ids.shape)
@@ -282,7 +409,7 @@ class MemoryEfficientQwen2AVLM(MemoryEfficientQwen2AudioLM):
 
         # print(use_cache, past_key_values)
 
-        outputs = self.language_model(
+        outputs = self.forward_lm(
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
@@ -293,7 +420,6 @@ class MemoryEfficientQwen2AVLM(MemoryEfficientQwen2AudioLM):
             return_dict=return_dict,
         )
 
-        # TODO : get the output hidden states from language model only, not the states
         logits = outputs[0]
 
         loss = None
@@ -305,13 +431,13 @@ class MemoryEfficientQwen2AVLM(MemoryEfficientQwen2AudioLM):
             full_length = logits.size(1)
 
             # Shift so that tokens < n predict n
-            if attention_mask is not None:
-                shift_attention_mask = attention_mask[..., 1:]
-                shift_logits = logits[..., :-1, :][shift_attention_mask.to(logits.device) != 0].contiguous()
-                shift_labels = labels[..., 1:][shift_attention_mask.to(labels.device) != 0].contiguous()
-            else:
-                shift_logits = logits[..., :-1, :].contiguous()
-                shift_labels = labels[..., 1:].contiguous()
+            # if attention_mask is not None:
+            #     shift_attention_mask = attention_mask[..., 1:]
+            #     shift_logits = logits[..., :-1, :][shift_attention_mask.to(logits.device) != 0].contiguous()
+            #     shift_labels = labels[..., 1:][shift_attention_mask.to(labels.device) != 0].contiguous()
+            # else:
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
 
             mask = shift_labels != -100
             shift_logits = shift_logits[mask]
@@ -319,7 +445,7 @@ class MemoryEfficientQwen2AVLM(MemoryEfficientQwen2AudioLM):
 
             label_smoothing = self.label_smoothing if self.training else 0.0
 
-            # do hidden -> logits after filtering the items to save memory
+            # do hidden -> logits after filtering/flattening the items to save memory
             shift_logits = self.language_model.lm_head(shift_logits)
             if fast_xentropy:
                 half_to_float = (shift_logits.dtype == torch.float16) or (shift_logits.dtype == torch.bfloat16)
@@ -343,26 +469,12 @@ class MemoryEfficientQwen2AVLM(MemoryEfficientQwen2AudioLM):
                     shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1).to(shift_logits.device)
                 )
 
-            if self.kl_scale > 0 and self.training:
-                kl_loss = self._compute_kl()
-                kl_loss = kl_loss.to(dtype=ce_loss.dtype)
-                kl_loss_data = kl_loss.item()
-
-                loss = ce_loss + kl_loss * self.kl_scale
-
-            else:
-                kl_loss, kl_loss_data = 0, 0
-                loss = ce_loss
-
             ce_loss_data = ce_loss.item()
             additional_losses["ce_loss"] = ce_loss_data
-            if self.kl_scale > 0.0:
-                additional_losses["kl_loss"] = kl_loss_data
+            loss = ce_loss
 
         else:
             logits = self.language_model.lm_head(logits)
-
-            # print(logits.size())
 
         if not return_dict:
             output = (logits,) + outputs[1:]
@@ -475,6 +587,7 @@ def create_qwen2av_model(load_path,
 
     if load_path and os.path.exists(load_path):
 
+        print("Loading pretrained model from %s" % load_path)
         if device_map != "none":
             model = model_class.from_pretrained(load_path,
                                                 trust_remote_code=True,
@@ -515,4 +628,4 @@ def create_qwen2av_model(load_path,
     return model
 
 
-AutoModel.register(Qwen2AudioVideoConfig, MemoryEfficientQwen2AVLM)
+AutoModel.register(Qwen2AVConfig, MemoryEfficientQwen2AVLM)

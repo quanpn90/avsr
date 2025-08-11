@@ -25,9 +25,16 @@ def cut_or_pad(data, size, dim=0):
     """
     Pads or trims the data along a dimension.
     """
+    # print(data.size())
+    # print(size)
+
     if data.size(dim) < size:
         padding = size - data.size(dim)
-        data = torch.nn.functional.pad(data, (0, 0, 0, padding), "constant")
+        try:
+            data = torch.nn.functional.pad(data, (0, 0, 0, padding), "constant")
+        except RuntimeError as e:
+            print("Error while padding", data.size(), size, padding)
+            raise e
         size = data.size(dim)
     elif data.size(dim) > size:
         data = data[:size]
@@ -46,6 +53,18 @@ def load_video(path, start_time=0, end_time=None):
     # vid_rgb = torchvision.io.read_video(path, start_pts=start_time, end_pts=end_time, pts_unit="sec", output_format="THWC")[0]
     frames = [cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY) for frame in vid_rgb.numpy()]
     vid = torch.from_numpy(np.stack(frames)).unsqueeze(1)
+    return vid
+
+
+def load_video_rgb(path, start_time=0, end_time=None):
+    """
+    rtype: torch, T x C x H x W
+    """
+    video_decoder = VideoDecoder(path, dimension_order="NHWC")
+    if end_time is None:
+        end_time = video_decoder.metadata.duration_seconds
+    vid_rgb = video_decoder.get_frames_played_in_range(start_time, end_time).data
+    vid = vid_rgb.permute(0, 3, 1, 2)
     return vid
 
 
@@ -249,6 +268,32 @@ class VideoTransform:
     def __call__(self, sample):
         # sample: T x C x H x W
         # rtype: T x 1 x H x W
+        return self.video_pipeline(sample)
+
+
+class VideoTransformRGB:
+    def __init__(self, subset):
+        if subset == "train":
+            self.video_pipeline = torch.nn.Sequential(
+                FunctionalModule(lambda x: x / 255.0),  # normalize
+                torchvision.transforms.Resize((384, 384)),  # resize to 384 x 384 = ViT format
+                # torchvision.transforms.RandomCrop(88),
+                # torchvision.transforms.Grayscale(),
+                # AdaptiveTimeMask(10, 25),
+                torchvision.transforms.Normalize([0.5] * 3, [0.5] * 3),  # Normalize for ViT/SigLip/CLIP
+                # torchvision.transforms.Normalize(0.421, 0.165),
+            )
+        elif subset == "val" or subset == "test":
+            self.video_pipeline = torch.nn.Sequential(
+                FunctionalModule(lambda x: x / 255.0),
+                torchvision.transforms.Resize((384, 384)),  # resize to 384 x 384 = ViT format
+                # torchvision.transforms.Grayscale(),
+                torchvision.transforms.Normalize([0.5] * 3, [0.5] * 3),  # Normalize for ViT/SigLip/CLIP
+            )
+
+    def __call__(self, sample):
+        # sample: T x C x H x W
+        # rtype: T x C x H x W
         return self.video_pipeline(sample)
 
 

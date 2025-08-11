@@ -201,16 +201,14 @@ class Qwen2AVEvalCollator:
     spec_freq_masking = T.FrequencyMasking(freq_mask_param=30)
     rate_ratio: int = 640
 
-    eos_token = "<|endoftext|>"
-    eos_token_id = 151643
+    eos_token = "<|im_end|>"
+    eos_token_id = 151645
     audio_eos_token_id = 151648
 
     def __init__(self, processor,
                  prompt_template="<|video_bos|><|VIDEO|><|video_eos|><|audio_bos|><|AUDIO|><|audio_eos|>Transcribe this speech:",
                  video_transform=None,
                  audio_transform=None,
-                 wav_augment=False,
-                 spec_augment=False,
                  include_text=False,
                  version=2.0):
         self.processor = processor
@@ -223,9 +221,6 @@ class Qwen2AVEvalCollator:
         self.lang_ids = {token: processor.tokenizer.convert_tokens_to_ids(token) for token in LANG_TOKENS}
 
         print(self.lang_ids)
-
-        self.do_wav_augment = wav_augment
-        self.do_spec_augment = spec_augment
 
         self.include_text = include_text
         self.audio_transform = audio_transform
@@ -299,7 +294,4 @@ class Qwen2AVEvalCollator:
     def _get_prompt(self, language_token):
         # add space between or not add space between?
 
-        if self.version == 2.0:
-            return f"{self.prompt_template}{language_token}"
-        else:
-            return f"{self.prompt_template} {language_token}"
+        return f"{self.prompt_template}{language_token}"
