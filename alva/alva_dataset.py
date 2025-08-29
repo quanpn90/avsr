@@ -1,5 +1,6 @@
 from src.dataset.qwen_av_dataset import Qwen2AVDataCollator
 import re
+import os
 import torch
 import torchaudio.transforms as T
 import random
@@ -10,6 +11,8 @@ from src.dataset.avhubert_dataset import AdaptiveTimeMask, AddMultiSpk, AddNoise
 from src.dataset.avhubert_dataset import FBanksAndStack, collate_pad, VideoTransform
 
 from src.dataset.qwen_audio_dataset import normalize_transcript, WavAudioTransform
+
+from script.compute_llava_features import process_sample_id, load_npz_zstd
 
 
 @dataclass
@@ -30,11 +33,14 @@ class AlvaDataCollator(Qwen2AVDataCollator):
 
     version = 2.0
 
+    # root_dir = "./LLAVA-ONE-features-3x3/"
+
     def __init__(self, processor,
                  prompt_template="<|audio_bos|><|AUDIO|><|audio_eos|>Transcribe this speech:",
                  video_transform=None,
                  audio_transform=None,
                  text_transform=None,
+                 feature_cache=None,
                  **kwargs):
         super().__init__(processor, prompt_template, video_transform, audio_transform, **kwargs)
 
@@ -44,6 +50,13 @@ class AlvaDataCollator(Qwen2AVDataCollator):
         self.bos_token = self.processor.tokenizer.bos_token
         self.eos_token = self.processor.tokenizer.eos_token
 
+        if len(feature_cache) == 0 or not os.path.exists(feature_cache):
+            feature_cache = None
+            print('[INFO] No feature cache found.')
+        else:
+            print("[INFO] Found feature cache from {}".format(feature_cache))
+        self.feature_cache = feature_cache
+
     def __call__(self, features: List[Dict[str, Union[List[int], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
 
         audio_list = list()
@@ -51,11 +64,16 @@ class AlvaDataCollator(Qwen2AVDataCollator):
         text_list = list()
         language = "en"
         samples = list()
+
+        video_features = list() if self.feature_cache is not None else None
+
         for feature in features:
             if "start_time" in feature and "end_time" in feature:
                 video = load_video_rgb(feature["video"], feature["start_time"], feature["end_time"])
             else:
                 video = load_video_rgb(feature["video"])
+
+            video_array = video
 
             if "start_time" in feature and "end_time" in feature:
                 audio = load_audio(feature["video"], feature["start_time"], feature["end_time"])
@@ -82,6 +100,18 @@ class AlvaDataCollator(Qwen2AVDataCollator):
             ctc_label = self.text_transform.tokenize(label)
             samples.append({"label": ctc_label})
 
+            if self.feature_cache is not None:
+                hashed_sample_id = process_sample_id(feature["sample_id"], decoding=False)
+                ds_name = feature["dataset_name"]
+                split = feature["split_name"]
+
+                video_array = feature["video"]
+                output_path = os.path.join(self.feature_cache, ds_name, split, hashed_sample_id)
+                feats = load_npz_zstd(output_path, "tokens_fp16")
+                feats = torch.from_numpy(feats).to(torch.bfloat16)
+
+                video_features.append(feats)
+
         # Prepare prompt+target format for Qwen2-Audio
         label_list = [
             self._concat_prompt(example)
@@ -93,6 +123,7 @@ class AlvaDataCollator(Qwen2AVDataCollator):
             audio=audio_list,
             text=label_list,
             video=video_list,
+            video_features=video_features,
             sampling_rate=16000,
             return_tensors="pt",
             padding=True  # pads both input_ids and audio

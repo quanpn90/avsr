@@ -294,8 +294,6 @@ if __name__ == "__main__":
 
     alva_base = "alva-base"
     from alva.alva_model import AlvaConfig, create_alva_model
-
-    # llama and qwen probably can share the same data collator
     from src.dataset.qwen_av_dataset import WavAudioTransform
     from alva.alva_dataset import AlvaDataCollator
     from alva.alva_processor import AlvaProcessor

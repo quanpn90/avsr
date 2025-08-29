@@ -181,8 +181,9 @@ class AlvaAVProjector(nn.Module):
 
 class AlvaLM(AlvaPreTrainedModel, GenerationMixin):
     config_class = AlvaConfig
-    whisper_encoder_mask_prob = 0.0
-    avhubert_encoder_mask_prob = 0.0
+
+
+    ctc_loss_alpha = 0.0
 
     def __init__(self, config: AlvaConfig,
                  attn_implementation="flash_attention_2",
@@ -210,9 +211,6 @@ class AlvaLM(AlvaPreTrainedModel, GenerationMixin):
         self.language_model = LlamaForCausalLM(config.text_config)
         if self.language_model._tied_weights_keys is not None:
             self._tied_weights_keys = [f"language_model.{k}" for k in self.language_model._tied_weights_keys]
-
-        config.avhubert_config.audio_dropout = 1.0
-        config.avhubert_config.modality_dropout = config.avhubert_audio_mask_prob
 
         # hardcode?
         config.avhubert_config._attn_implementation = "flash_attention_2"
@@ -245,6 +243,7 @@ class AlvaLM(AlvaPreTrainedModel, GenerationMixin):
         # self.label_smoothing = 0
         # self.kl_scale = 0.
         # self.kl_type = "kl_div"
+        self.ctc_loss_alpha = config.ctc_loss_alpha
 
     def load_pretrained_avhubert(self,
                                  encoder_pretrained_checkpoint="nguyenvulebinh/avhubert_encoder_large_noise_pt_noise_ft_433h",
@@ -323,16 +322,18 @@ class AlvaLM(AlvaPreTrainedModel, GenerationMixin):
 
     def set_audio_mask(self, args):
 
-        self.config.whisper_encoder_mask_prob = args.whisper_encoder_mask_prob
-        self.config.avhubert_audio_mask_prob = args.avhubert_audio_mask_prob
+        pass
 
-        # set
-        self.config.avhubert_config.audio_dropout = 1.0
-        self.config.avhubert_config.modality_dropout = self.config.avhubert_audio_mask_prob
-        self.avhubert_encoder.modality_dropout = self.config.avhubert_config.modality_dropout
-
-        self.whisper_encoder_mask_prob = args.whisper_encoder_mask_prob
-        self.avhubert_encoder_mask_prob = args.avhubert_audio_mask_prob
+        # self.config.whisper_encoder_mask_prob = args.whisper_encoder_mask_prob
+        # self.config.avhubert_audio_mask_prob = args.avhubert_audio_mask_prob
+        #
+        # # set
+        # self.config.avhubert_config.audio_dropout = 1.0
+        # self.config.avhubert_config.modality_dropout = self.config.avhubert_audio_mask_prob
+        # self.avhubert_encoder.modality_dropout = self.config.avhubert_config.modality_dropout
+        #
+        # self.whisper_encoder_mask_prob = args.whisper_encoder_mask_prob
+        # self.avhubert_encoder_mask_prob = args.avhubert_audio_mask_prob
 
     def forward_lm(self, attention_mask, position_ids, past_key_values,
                    inputs_embeds, use_cache, output_attentions, output_hidden_states, return_dict):
@@ -381,6 +382,7 @@ class AlvaLM(AlvaPreTrainedModel, GenerationMixin):
             input_ids: Optional[torch.LongTensor] = None,
             input_features: Optional[torch.FloatTensor] = None,
             pixel_values_videos: Optional[torch.FloatTensor] = None,
+            video_features: Optional[torch.FloatTensor] = None,
             attention_mask: Optional[torch.Tensor] = None,
             feature_attention_mask: Optional[torch.Tensor] = None,
             position_ids: Optional[torch.LongTensor] = None,
@@ -461,58 +463,62 @@ class AlvaLM(AlvaPreTrainedModel, GenerationMixin):
 
             # 2. Merge text and audios
             if input_features is not None and input_ids.shape[1] != 1:
-                context = torch.no_grad() if self.freeze_audio_encoder else nullcontext()
-                with context:
-                    audio_feat_lengths, audio_output_lengths = self.audio_tower._get_feat_extract_output_lengths(
-                        feature_attention_mask.sum(-1)
+                # context = torch.no_grad() if self.freeze_audio_encoder else nullcontext()
+                # with context:
+                audio_feat_lengths, audio_output_lengths = self.audio_tower._get_feat_extract_output_lengths(
+                    feature_attention_mask.sum(-1)
+                )
+                batch_size, _, max_mel_seq_len = input_features.shape
+                max_seq_len = (max_mel_seq_len - 2) // 2 + 1
+                # Create a sequence tensor of shape (batch_size, max_seq_len)
+                seq_range = (
+                    torch.arange(0, max_seq_len, dtype=audio_feat_lengths.dtype, device=audio_feat_lengths.device)
+                    .unsqueeze(0)
+                    .expand(batch_size, max_seq_len)
+                )
+                lengths_expand = audio_feat_lengths.unsqueeze(1).expand(batch_size, max_seq_len)
+                # Create mask
+                padding_mask = seq_range >= lengths_expand
+
+                if self.audio_tower._attn_implementation != "flash_attention_2":
+                    audio_attention_mask_ = padding_mask.view(batch_size, 1, 1, max_seq_len).expand(
+                        batch_size, 1, max_seq_len, max_seq_len
                     )
-                    batch_size, _, max_mel_seq_len = input_features.shape
-                    max_seq_len = (max_mel_seq_len - 2) // 2 + 1
-                    # Create a sequence tensor of shape (batch_size, max_seq_len)
-                    seq_range = (
-                        torch.arange(0, max_seq_len, dtype=audio_feat_lengths.dtype, device=audio_feat_lengths.device)
-                        .unsqueeze(0)
-                        .expand(batch_size, max_seq_len)
+                    audio_attention_mask = audio_attention_mask_.to(
+                        dtype=self.audio_tower.conv1.weight.dtype, device=self.audio_tower.conv1.weight.device
                     )
-                    lengths_expand = audio_feat_lengths.unsqueeze(1).expand(batch_size, max_seq_len)
-                    # Create mask
-                    padding_mask = seq_range >= lengths_expand
+                    audio_attention_mask[audio_attention_mask_] = float("-inf")
+                else:
+                    audio_attention_mask = (1 - padding_mask.float()).bool()
 
-                    if self.audio_tower._attn_implementation != "flash_attention_2":
-                        audio_attention_mask_ = padding_mask.view(batch_size, 1, 1, max_seq_len).expand(
-                            batch_size, 1, max_seq_len, max_seq_len
-                        )
-                        audio_attention_mask = audio_attention_mask_.to(
-                            dtype=self.audio_tower.conv1.weight.dtype, device=self.audio_tower.conv1.weight.device
-                        )
-                        audio_attention_mask[audio_attention_mask_] = float("-inf")
-                    else:
-                        audio_attention_mask = (1 - padding_mask.float()).bool()
+                # print("[INFO] Audio Tower processing finished")
 
-                    # print("[INFO] Audio Tower processing finished")
+                audio_outputs = self.audio_tower(input_features, attention_mask=audio_attention_mask)
+                selected_audio_feature = audio_outputs.last_hidden_state
+                audio_features = selected_audio_feature
 
-                    audio_outputs = self.audio_tower(input_features, attention_mask=audio_attention_mask)
-                    selected_audio_feature = audio_outputs.last_hidden_state
-                    audio_features = selected_audio_feature
+                # if we have consecutive audio tokens, then it means we expanded input_ids in processing
+                audio_tokens = input_ids == self.config.audio_token_id
+                legacy_processing = (audio_tokens[:, :-1] & audio_tokens[:, 1:]).sum() == 0
 
-                    # if we have consecutive audio tokens, then it means we expanded input_ids in processing
-                    audio_tokens = input_ids == self.config.audio_token_id
-                    legacy_processing = (audio_tokens[:, :-1] & audio_tokens[:, 1:]).sum() == 0
+                if legacy_processing:
+                    raise NotImplementedError("legacy processing is not supported")
 
-                    if legacy_processing:
-                        raise NotImplementedError("legacy processing is not supported")
+                num_audios, max_audio_tokens, embed_dim = audio_features.shape
+                audio_features_mask = torch.arange(max_audio_tokens, device=audio_output_lengths.device)[None, :]
+                audio_features_mask = audio_features_mask < audio_output_lengths[:, None]
 
-                    num_audios, max_audio_tokens, embed_dim = audio_features.shape
-                    audio_features_mask = torch.arange(max_audio_tokens, device=audio_output_lengths.device)[None, :]
-                    audio_features_mask = audio_features_mask < audio_output_lengths[:, None]
+                # cut off the padded positions to prepare for  AVHuBERT
+                max_length_without_pad = max(audio_output_lengths.tolist())
+                audio_features = audio_features[:, :max_length_without_pad, :]
+                audio_features_mask = audio_features_mask[:, :max_length_without_pad]
 
-                    # cut off the padded positions to prepare for  AVHuBERT
-                    max_length_without_pad = max(audio_output_lengths.tolist())
-                    audio_features = audio_features[:, :max_length_without_pad, :]
-                    audio_features_mask = audio_features_mask[:, :max_length_without_pad]
+                # TODO: when we also have pixels, we
+                if pixel_values_videos is not None:
 
-                    # TODO: when we also have pixels, we
-                    if pixel_values_videos is not None:
+                    assert video_features is not None
+
+                    if video_features is None:
                         B, T, C, H, W = pixel_values_videos.shape
 
                         pixel_values_videos = pixel_values_videos.view(B * T, C, H, W)
@@ -521,45 +527,51 @@ class AlvaLM(AlvaPreTrainedModel, GenerationMixin):
                         with torch.no_grad():
                             video_outputs = self.vision_tower(pixel_values_videos)
                             video_features = video_outputs.last_hidden_state
+                    else:
+                        # print("[INFO] get preloaded features")
+                        video_features = video_features.to(audio_features.device)
+                        video_features = video_features.to(audio_features.dtype)
 
+                        B, T, P, H = video_features.size()
+                        video_features = video_features.view(B * T, P, H)
                         # print("[INFO] Video Tower processing finished")
 
-                        audio_features, video_features = self.cross_modal_projector(audio_features, video_features)
+                    audio_features, video_features = self.cross_modal_projector(audio_features, video_features)
 
-                        # print("[INFO] Cross-Modality projection finished")
+                    # print("[INFO] Cross-Modality projection finished")
 
-                    else:
-                        audio_features = self.cross_modal_projector.q_proj(audio_features)
-                        video_features = torch.zeros_like(audio_features)
+                else:
+                    audio_features = self.cross_modal_projector.q_proj(audio_features)
+                    video_features = torch.zeros_like(audio_features)
 
-                    av_features = self.avhubert_encoder.forward_av_features(audio_features,
-                                                                            video_features,
-                                                                            audio_features_mask)
+                av_features = self.avhubert_encoder.forward_av_features(audio_features,
+                                                                        video_features,
+                                                                        audio_features_mask)
 
-                    # print("[INFO] AV-HuBERT Alignment processing finished")
+                # print("[INFO] AV-HuBERT Alignment processing finished")
 
-                    ctc_av_features = av_features
-                    video_lengths = audio_features_mask.long().sum(dim=1)
+                ctc_av_features = av_features
+                video_lengths = audio_features_mask.long().sum(dim=1)
 
-                    av_features = av_features[audio_features_mask]
-                    n_audio_tokens = (input_ids == self.config.audio_token_id).sum().item()
-                    n_audio_features = av_features.shape[0]
+                av_features = av_features[audio_features_mask]
+                n_audio_tokens = (input_ids == self.config.audio_token_id).sum().item()
+                n_audio_features = av_features.shape[0]
 
-                    if n_audio_tokens != n_audio_features:
-                        raise ValueError(
-                            f"Audio features and audio tokens do not match: tokens: {n_audio_tokens}, features {n_audio_features}"
-                        )
-                    special_audio_mask = (input_ids == self.config.audio_token_id).to(inputs_embeds.device)
-                    special_audio_mask = special_audio_mask.unsqueeze(-1).expand_as(inputs_embeds)
-                    av_features = av_features.to(inputs_embeds.device, inputs_embeds.dtype)
-                    av_features = self.av_projector(av_features)
+                if n_audio_tokens != n_audio_features:
+                    raise ValueError(
+                        f"Audio features and audio tokens do not match: tokens: {n_audio_tokens}, features {n_audio_features}"
+                    )
+                special_audio_mask = (input_ids == self.config.audio_token_id).to(inputs_embeds.device)
+                special_audio_mask = special_audio_mask.unsqueeze(-1).expand_as(inputs_embeds)
+                av_features = av_features.to(inputs_embeds.device, inputs_embeds.dtype)
+                av_features = self.av_projector(av_features)
 
-                    # print(inputs_embeds.size(), av_features.size(), special_audio_mask.size())
+                # print(inputs_embeds.size(), av_features.size(), special_audio_mask.size())
 
-                    # randomly mask out the features
-                    # av_features = torch.nn.functional.dropout(av_features, self.whisper_encoder_mask_prob,
-                    #                                              training=self.training)
-                    inputs_embeds = inputs_embeds.masked_scatter(special_audio_mask, av_features)
+                # randomly mask out the features
+                # av_features = torch.nn.functional.dropout(av_features, self.whisper_encoder_mask_prob,
+                #                                              training=self.training)
+                inputs_embeds = inputs_embeds.masked_scatter(special_audio_mask, av_features)
 
                     # print("[INFO] AV Embedding processing finished")
 
@@ -636,8 +648,8 @@ class AlvaLM(AlvaPreTrainedModel, GenerationMixin):
             # else:
             # kl_loss, kl_loss_data = 0, 0
             # loss = ce_loss
-            if self.config.ctc_loss_alpha > 0.0:
-                alpha = self.config.ctc_loss_alpha
+            if self.ctc_loss_alpha > 0.0:
+                alpha = self.ctc_loss_alpha
                 loss_ctc, ys_hat = self.ctc(ctc_av_features, video_lengths, ctc_labels)
                 loss = (1 - alpha) * ce_loss + alpha * loss_ctc
                 additional_losses["ctc_loss"] = loss_ctc.item()
@@ -667,6 +679,11 @@ class AlvaLM(AlvaPreTrainedModel, GenerationMixin):
             attention_mask=attention_mask,
             additional_losses=additional_losses
         )
+
+    def set_ctc_loss_alpha(self, alpha):
+
+        self.ctc_loss_alpha = alpha
+        self.config.ctc_loss_alpha = alpha
 
 
 def create_alva_model(load_path,
@@ -801,6 +818,7 @@ if __name__ == "__main__":
 
     # print(alva_model)
     alva_model = alva_model.cuda().to(torch.bfloat16)
+    alva_model.vision_tower = alva_model.vision_tower.cpu()
     # alva_model.load_
 
     processor = AlvaProcessor.from_pretrained("alva-base")

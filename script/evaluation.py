@@ -139,7 +139,7 @@ class AutoAVSRModel(BaseInferenceModel):
         self.av_data_collator = DataCollator(
             text_transform=self.text_transform,
             audio_transform=audio_transform,
-            video_transform=video_transform,ffffffffff
+            video_transform=video_transform,
         )
 
         # Load model    

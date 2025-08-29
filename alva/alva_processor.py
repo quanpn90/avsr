@@ -26,6 +26,7 @@ from transformers.feature_extraction_utils import BatchFeature
 from transformers.processing_utils import ProcessingKwargs, ProcessorMixin, Unpack
 from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
 from transformers.utils.deprecation import deprecate_kwarg
+from transformers import LlavaOnevisionVideoProcessor
 
 
 class AlvaProcessorKwargs(ProcessingKwargs, total=False):
@@ -132,6 +133,36 @@ class AlvaProcessor(ProcessorMixin):
         self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
         self.tokenizer.padding_side = "left"
 
+    def pad_video_features(self, features, output_kwargs=None):
+
+        if features is None:
+            return None
+
+        lengths = torch.tensor([feature.size(0) for feature in features], dtype=torch.long)
+        T_max = int(lengths.max().item())
+        B = len(features)
+        P, D = features[0].size(1), features[0].size(2)
+
+        dtype = features[0].dtype
+        device = features[0].device
+
+        # Preallocate output + mask
+        out = torch.zeros((B, T_max, P, D), dtype=dtype, device=device)
+        non_blocking = True
+        # print("output size", out.size())
+        # Fill per-sample (batch size is tiny; this is fine)
+        for i, v in enumerate(features):
+            v = v.to(device=device, dtype=dtype, non_blocking=non_blocking)
+            T = v.size(0)
+            out[i, :T].copy_(v)  # copy real frames
+            # mask[i, :T] = True
+            if T < T_max:
+                # Repeat last frame without materializing copies
+                last = v[-1:].expand(T_max - T, -1, -1)  # [pad, C, H, W]
+                out[i, T:T_max].copy_(last)
+
+        return out
+
     def get_video_lengths(self, videos,
                           num_av, output_kwargs=None):
 
@@ -172,7 +203,6 @@ class AlvaProcessor(ProcessorMixin):
 
         return video_inputs, lengths.tolist()
 
-
     def get_audio_lengths(self, audio,
                           num_av, output_kwargs=None):
 
@@ -191,12 +221,12 @@ class AlvaProcessor(ProcessorMixin):
 
             return audio_inputs, audio_lengths
 
-
     def __call__(
             self,
             text: Union[TextInput, PreTokenizedInput, List[TextInput], List[PreTokenizedInput]] = None,
             audio: Union[np.ndarray, List[np.ndarray]] = None,
             video: Union[torch.Tensor, List[torch.Tensor]] = None,
+            video_features: Union[torch.Tensor, List[torch.Tensor]] = None,
             **kwargs: Unpack[AlvaProcessorKwargs],
     ) -> BatchFeature:
         """
@@ -268,7 +298,11 @@ class AlvaProcessor(ProcessorMixin):
             # audio_lengths = audio_inputs["feature_attention_mask"].sum(-1).tolist()
 
             audio_inputs, audio_lengths = self.get_audio_lengths(audio, num_av, output_kwargs)
-            video_inputs, video_lengths = self.get_video_lengths(video, num_av, output_kwargs)
+
+            if video_features is None:
+                video_inputs, video_lengths = self.get_video_lengths(video, num_av, output_kwargs)
+            else:
+                video_inputs, video_lengths = None, None
 
             expanded_text = []
             for sample in text:
@@ -281,13 +315,14 @@ class AlvaProcessor(ProcessorMixin):
                     input_length = (audio_length - 1) // 2 + 1
                     num_audio_tokens = (input_length - 2) // 2 + 1
 
-                    num_video_tokens = num_video_frames = video_lengths.pop(0)
-
-                    if audio is not None and video is not None:
-                        assert num_audio_tokens == num_video_tokens, (
-                            f"Expected the number of audio and video tokens to match, "
-                            f"but got {num_audio_tokens} audio tokens and {num_video_tokens} video tokens."
-                        )
+                    # num_video_tokens = num_video_frames = video_lengths.pop(0)
+                    #
+                    # if audio is not None and video is not None:
+                    #     assert num_audio_tokens == num_video_tokens, (
+                    #         f"Expected the number of audio and video tokens to match, "
+                    #         f"but got {num_audio_tokens} audio tokens and {num_video_tokens} video tokens."
+                    #     )
+                    num_video_tokens = 0
 
                     # select the non-zero tokens (audio or video)
                     num_av_tokens = max(num_audio_tokens, num_video_tokens)
@@ -326,8 +361,14 @@ class AlvaProcessor(ProcessorMixin):
         if audio is not None:
             inputs.update(audio_inputs)
 
-        if video is not None:
+        if video_inputs is not None:
             inputs.update(video_inputs)
+
+        if video_features is not None:
+            assert isinstance(video_features, list)
+            inputs["video_features"] = self.pad_video_features(video_features)
+        else:
+            inputs["video_features"] = None
 
         return BatchFeature(data={**inputs}, tensor_type=return_tensors)
 
@@ -410,7 +451,6 @@ class AlvaProcessor(ProcessorMixin):
 
 __all__ = ["AlvaProcessor"]
 
-
 if __name__ == "__main__":
 
     # TODO: create AVProcessor
@@ -422,13 +462,17 @@ if __name__ == "__main__":
     default_llava = "llava-hf/llava-onevision-qwen2-7b-ov-hf"
     import datasets
 
-    cache_dir = "/hkfs/work/workspace/scratch/pj5699-bayesian_speechlm/text2asr/data-bin/cache"
+    cache_dir = "data-bin/cache"
 
     from transformers import (AutoTokenizer, AutoProcessor, LlavaOnevisionProcessor,
                               AutoConfig, LlavaOnevisionForConditionalGeneration)
     from transformers.models.siglip.modeling_siglip import SiglipVisionModel
     from transformers.models.llava_onevision.configuration_llava_onevision import LlavaOnevisionConfig
     from src.dataset.avhubert_dataset import load_video_rgb, load_audio, cut_or_pad
+    from script.compute_llava_features import process_sample_id, load_npz_zstd
+    import os
+
+    root_dir = "./LLAVA-ONE-features-3x3/"
 
     # we need to create 1 tokenizer, 1 audio frame extractor, 1 video feature extractor
 
@@ -448,14 +492,20 @@ if __name__ == "__main__":
 
     print("Created ALVA processor successfully!")
 
-    test_dataset = datasets.load_dataset("nguyenvulebinh/AVYT", "lrs2", streaming=True,
+    test_dataset = datasets.load_dataset("nguyenvulebinh/AVYT", "lrs2", streaming=False,
                                          cache_dir=cache_dir).remove_columns(['__key__', '__url__'])['train']
+
+    ds_name = "lrs2"
+    split_name = "train"
+    test_dataset = test_dataset.add_column("dataset_name", [ds_name] * len(test_dataset))
+    test_dataset = test_dataset.add_column("split_name", [split_name] * len(test_dataset))
 
     iterator = iter(test_dataset)
 
     video_rgbs = []
     texts = []
     audios = []
+    features = []
 
     prompt_template = "<|video_bos|><|VIDEO|><|video_eos|><|audio_bos|><|AUDIO|><|audio_eos|>Transcribe this speech:"
     rate_ratio = 640
@@ -479,7 +529,18 @@ if __name__ == "__main__":
 
         texts.append(text)
 
-    inputs = alva_processor(texts, audios, video_rgbs, return_tensors="pt", padding=True)
+        hashed_sample_id = process_sample_id(sample["sample_id"])
+        ds_name = sample["dataset_name"]
+        split = sample["split_name"]
+
+        output_path = os.path.join(root_dir, ds_name, split, hashed_sample_id)
+        feats = load_npz_zstd(output_path, "tokens_fp16")
+        feats = torch.from_numpy(feats).to(torch.bfloat16)
+
+        features.append(feats)
+
+    inputs = alva_processor(texts, audios, video_rgbs, features,
+                            return_tensors="pt", padding=True)
 
     # for key in inputs:
     #     print(key)
@@ -519,4 +580,3 @@ if __name__ == "__main__":
     #
     # vision_tower = llm.model.vision_tower
     # print(vision_tower)
-
