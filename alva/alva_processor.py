@@ -282,6 +282,7 @@ class AlvaProcessor(ProcessorMixin):
             num_av = max(num_videos, num_audios)
 
             if num_audio_tokens != num_av:
+                print("current prompt:", text)
                 raise ValueError(
                     f"Found {num_audio_tokens} {self.audio_token} token{'s' if num_audio_tokens > 1 else ''} in provided text but received {num_audios} audio{'s' if num_audios > 1 else ''}"
                 )
@@ -366,9 +367,12 @@ class AlvaProcessor(ProcessorMixin):
 
         if video_features is not None:
             assert isinstance(video_features, list)
+            assert len(video_features) > 0
             inputs["video_features"] = self.pad_video_features(video_features)
         else:
             inputs["video_features"] = None
+
+        # print(inputs)
 
         return BatchFeature(data={**inputs}, tensor_type=return_tensors)
 

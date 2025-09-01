@@ -50,7 +50,7 @@ class AlvaDataCollator(Qwen2AVDataCollator):
         self.bos_token = self.processor.tokenizer.bos_token
         self.eos_token = self.processor.tokenizer.eos_token
 
-        if len(feature_cache) == 0 or not os.path.exists(feature_cache):
+        if feature_cache is None or len(feature_cache) == 0 or not os.path.exists(feature_cache):
             feature_cache = None
             print('[INFO] No feature cache found.')
         else:
@@ -177,8 +177,27 @@ class AlvaEvalDataCollator(AlvaDataCollator):
 
     def __init__(self, processor,
                  prompt_template="<|audio_bos|><|AUDIO|><|audio_eos|>Transcribe this speech:",
-                 video_transform=None, audio_transform=None, version=2.0, **kwargs):
-        super().__init__(processor, prompt_template, video_transform, audio_transform, version, **kwargs)
+                 video_transform=None,
+                 audio_transform=None,
+                 text_transform=None,
+                 feature_cache=None,
+                 **kwargs):
+        super().__init__(processor, prompt_template, video_transform, audio_transform,
+                         text_transform, feature_cache, **kwargs)
+
+        # self.text_transform = text_transform
+        # self.eos_token_id = self.processor.tokenizer.eos_token_id
+        # self.bos_token_id = self.processor.tokenizer.bos_token_id
+        # self.bos_token = self.processor.tokenizer.bos_token
+        # self.eos_token = self.processor.tokenizer.eos_token
+        #
+        # if len(feature_cache) == 0 or not os.path.exists(feature_cache):
+        #     feature_cache = None
+        #     print('[INFO] No feature cache found.')
+        # else:
+        #     print("[INFO] Found feature cache from {}".format(feature_cache))
+        # self.feature_cache = feature_cache
+
 
     def __call__(self, features: List[Dict[str, Union[List[int], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
 
@@ -187,59 +206,79 @@ class AlvaEvalDataCollator(AlvaDataCollator):
         text_list = list()
         language = "en"
         samples = list()
+
+        video_features = list() if self.feature_cache is not None else None
+
         for feature in features:
             if "start_time" in feature and "end_time" in feature:
-                video = load_video(feature["video"], feature["start_time"], feature["end_time"])
+                video = load_video_rgb(feature["video"], feature["start_time"], feature["end_time"])
             else:
-                video = load_video(feature["video"])
+                video = load_video_rgb(feature["video"])
+
+            video_array = video
 
             if "start_time" in feature and "end_time" in feature:
                 audio = load_audio(feature["video"], feature["start_time"], feature["end_time"])
             else:
                 audio = load_audio(feature["video"])
 
+            audio = audio
+
             # here we don't have to cut or pad if there is no video involved
             audio = cut_or_pad(audio, len(video) * self.rate_ratio)
             video = self.video_transform(video)
             video_list.append(video)
 
-            # here we divide the audio transform into 2 parts
-            # the augmentation part can be used for both Whisper and AVHubert
-            # the fbank & stack is only for AVHubert
+            # audio segmentation
             audio = self.audio_transform(audio)
-            audio_fbank = self.fbank_and_stack(audio)
 
             # note: the huggingface processor takes numpy instead of torch
             audio = audio.squeeze().numpy()
             audio_list.append(audio)
 
-            samples.append({"video": video, "audio": audio_fbank})
+            # label = feature["label"]
+            # text_list.append(normalize_transcript(label))
+            #
+            # ctc_label = self.text_transform.tokenize(label)
+            # samples.append({"label": ctc_label})
 
+            if self.feature_cache is not None:
+                # TODO: check decoding if its byte -> decode
+                hashed_sample_id = process_sample_id(feature["sample_id"], decoding=True)
+                ds_name = feature["dataset_name"]
+                split = feature["split_name"]
+
+                # video_array = feature["video"]
+                output_path = os.path.join(self.feature_cache, ds_name, split, hashed_sample_id)
+                feats = load_npz_zstd(output_path, "tokens_fp16")
+                feats = torch.from_numpy(feats).to(torch.bfloat16)
+
+                video_features.append(feats)
+            #
         # Prepare prompt+target format for Qwen2-Audio
         label_list = [
             self._get_prompt()
-            for _ in features
+            for _ in audio_list
         ]
+
+        # print("LABEL LIST", label_list)
 
         # sample rate taken from avhubert_dataset as 16000
         inputs = self.processor(
             audio=audio_list,
             text=label_list,
             video=video_list,
+            video_features=video_features,
             sampling_rate=16000,
             return_tensors="pt",
             padding=True  # pads both input_ids and audio
         )
 
-        # process inputs for avhubert
-        avhubert_inputs = collate_pad(samples)
-
-        inputs["videos"] = avhubert_inputs["videos"].permute(0, 2, 1, 3, 4)
-        inputs["audios"] = avhubert_inputs["audios"].permute(0, 2, 1)
-        inputs["video_lengths"] = avhubert_inputs["video_lengths"]
-        inputs["audio_lengths"] = avhubert_inputs["audio_lengths"]
+        inputs_ids = inputs["input_ids"]
+        attention_mask = inputs["attention_mask"]
 
         return inputs
+
 
     def _get_prompt(self, language="en"):
         return f"{self.prompt_template}{self.bos_token}"

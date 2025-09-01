@@ -500,7 +500,7 @@ class AlvaModel(BaseInferenceModel):
 
         from alva.alva_model import AlvaConfig, create_alva_model
         from src.dataset.qwen_av_dataset import WavAudioTransform
-        from alva.alva_dataset import AlvaDataCollator
+        from alva.alva_dataset import AlvaDataCollator, AlvaEvalDataCollator
         from alva.alva_processor import AlvaProcessor
 
         attention_type = "flash_attention_2"
@@ -537,15 +537,19 @@ class AlvaModel(BaseInferenceModel):
 
         prompt_template = "<|video_bos|><|VIDEO|><|video_eos|><|audio_bos|><|AUDIO|><|audio_eos|>Transcribe this speech:"
 
-        self.av_data_collator = LLama3AVEvalCollator(
+        # hardcode for now
+        feature_cache = "./LLAVA-ONE-features-3x3/"
+
+        self.av_data_collator = AlvaEvalDataCollator(
             processor,
             prompt_template=prompt_template,
             video_transform=video_transform,
             audio_transform=audio_transform,
+            feature_cache=feature_cache,
             version=self.version
         )
         #
-        avsr_model.eval().cuda().to(self.dtype)
+        avsr_model.eval().to(self.dtype).cuda()
         self.model = avsr_model
         self.processor = processor
 
@@ -654,7 +658,9 @@ class InferenceEngine:
         #     return MuAViCModel(self.checkpoint_path, self.cache_dir, self.beam_size, worker_id=self.worker_id)
         # else:
         #     raise ValueError(f"Unknown model type: {self.model_type}")
-        if self.model_type in ['llama3av']:
+        if self.model_type in ['alva']:
+            return AlvaModel(self.checkpoint_path, self.cache_dir, self.beam_size, worker_id=self.worker_id)
+        elif self.model_type in ['llama3av']:
             return Llama3AVModel(self.checkpoint_path, self.cache_dir, self.beam_size, worker_id=self.worker_id)
         elif self.model_type in ['qwenav', 'qwen2av', 'qwen2_av']:
             return Qwen2AVModel(self.checkpoint_path, self.cache_dir, self.beam_size, worker_id=self.worker_id)
@@ -710,10 +716,10 @@ class InferenceEngine:
         milliseconds = int((timestamp - int(timestamp)) * 1000)
         return f"{hours:02d}:{minutes:02d}:{seconds:02d}.{milliseconds:03d}"
 
-    def infer_processed_sample(self, video):
-        sample = {
-            "video": video
-        }
+    def infer_processed_sample(self, sample):
+        # sample = {
+        #     "video": video
+        # }
         inputs = self.model_impl.av_data_collator([sample])
         for key in inputs:
             inputs[key] = inputs[key].cuda()
@@ -839,7 +845,7 @@ def _eval_lrs2_single_worker(args, dataset, worker_id, result_queue):
 
         video = sample['video']
 
-        output = engine.infer_processed_sample(video)
+        output = engine.infer_processed_sample(sample)
         output = output[0]
         output_norm = norm_string(output.lower().replace("<unk>", ""))
 
@@ -1009,6 +1015,15 @@ def _eval_avcocktail_single_thread(args, video_dataset, label_dataset, worker_id
     return wer_scores, len(label_text.split())
 
 
+def add_columns(dset, ds_name, split_name):
+
+    num_entries = len(dset)
+
+    dset = dset.add_column("dataset_name", [ds_name] * num_entries)
+    dset = dset.add_column("split_name", [split_name] * num_entries)
+
+    return dset
+
 def main():
     parser = argparse.ArgumentParser(description="Unified inference script for multiple AVSR models")
 
@@ -1089,6 +1104,7 @@ def main():
 
     args = parser.parse_args()
 
+
     # Initialize inference engine
 
     if args.dataset_name == 'lrs2':
@@ -1105,6 +1121,10 @@ def main():
                 print(f"Inferring {args.dataset_name}/{set_id} sessions using {args.model_type} model")
                 dataset = datasets.load_dataset("nguyenvulebinh/AVYT", args.dataset_name, cache_dir='./data-bin/cache',
                                                 streaming=False)[set_id]
+
+                dataset = add_columns(dataset, args.dataset_name, set_id)
+
+
                 wer_score = eval_lrs2(args, dataset)
                 list_wer_scores.append(wer_score)
                 print(f"WER {set_id}: {wer_score:.4f}")
@@ -1112,7 +1132,12 @@ def main():
         else:
             print(f"Inferring {args.dataset_name}/{args.set_id} sessions using {args.model_type} model")
             dataset = datasets.load_dataset("nguyenvulebinh/AVYT", args.dataset_name, cache_dir='./data-bin/cache',
-                                            streaming=True)[args.set_id]
+                                            streaming=False)[args.set_id]
+
+            dataset = add_columns(dataset, args.dataset_name, args.set_id)
+            sample = dataset[0]
+            print(sample.keys())
+            print(sample['sample_id'])
 
             wer_score = eval_lrs2(args, dataset)
             print(f"WER: {wer_score}")

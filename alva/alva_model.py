@@ -514,8 +514,8 @@ class AlvaLM(AlvaPreTrainedModel, GenerationMixin):
                 audio_features_mask = audio_features_mask[:, :max_length_without_pad]
 
                 # TODO: when we also have pixels, we
-                if pixel_values_videos is not None:
-
+                if pixel_values_videos is not None or video_features is not None:
+                    # print("PROCESSING FEATURES")
                     assert video_features is not None
 
                     if video_features is None:
@@ -541,6 +541,9 @@ class AlvaLM(AlvaPreTrainedModel, GenerationMixin):
                     # print("[INFO] Cross-Modality projection finished")
 
                 else:
+                    # temporarily safeguard this, so code never runs into this
+                    raise NotImplementedError
+                    # print("NO VIDEO FEATURES")
                     audio_features = self.cross_modal_projector.q_proj(audio_features)
                     video_features = torch.zeros_like(audio_features)
 

@@ -78,6 +78,18 @@ def skip_check_and_enable_flash_attn_2(cls, config, **kwargs):
 # --model_name_or_path ./model-bin/avsr_cocktail \
 # --output_dir ./model-bin
 
+def add_columns(dset, ds_name):
+
+    for split in dset.keys():
+
+        split_name = split
+        num_entries = len(dset[split])
+
+        dset[split] = dset[split].add_column("dataset_name", [ds_name] * num_entries)
+        dset[split] = dset[split].add_column("split_name", [split_name] * num_entries)
+
+    return dset
+
 
 def load_avsr_dataset(cache_dir='./data-bin/cache/', include_mcorec=False, streaming=False):
     # streaming=True to avoid downloading all dataset at once, but it can be crash if network is unstable
@@ -94,17 +106,26 @@ def load_avsr_dataset(cache_dir='./data-bin/cache/', include_mcorec=False, strea
     try_times = 0
     max_try_times = 5
 
+    assert not streaming, "ALVA doesn't support streaming datasets"
+
     # while not finished_loading:
     try:
         # # Load dataset. It's quite bigdataset and sometime downloading can break. You can simple retry.
         lrs2 = datasets.load_dataset("nguyenvulebinh/AVYT", "lrs2", streaming=streaming,
                                      cache_dir=cache_dir).remove_columns(['__key__', '__url__'])
+        lrs2 = add_columns(lrs2, "lrs2")
+
         vox2 = datasets.load_dataset("nguyenvulebinh/AVYT", "vox2", streaming=streaming,
                                      cache_dir=cache_dir).remove_columns(['__key__', '__url__'])
+        vox2 = add_columns(vox2, "vox2")
+
         avyt = datasets.load_dataset("nguyenvulebinh/AVYT", "avyt", streaming=streaming,
                                      cache_dir=cache_dir).remove_columns(['__key__', '__url__'])
+        avyt = add_columns(avyt, "avyt")
+
         avyt_mix = datasets.load_dataset("nguyenvulebinh/AVYT", "avyt-mix", streaming=streaming,
                                          cache_dir=cache_dir).remove_columns(['__key__', '__url__'])
+        avyt_mix = add_columns(avyt_mix, "avyt-mix")
         # Load mcorec dataset. Ensure you have permission to use this dataset.
         if include_mcorec:
             print("Loading MCoRec dataset")
@@ -251,8 +272,8 @@ if __name__ == "__main__":
     parser.add_argument("--whisper_encoder_mask_prob", type=float, default=0.5)
     parser.add_argument("--avhubert_audio_mask_prob", type=float, default=0.5)
     parser.add_argument("--label_smoothing", type=float, default=0.0)
-
-    parser.add_argument("--qwenav_version", type=float, default=2.0)
+    parser.add_argument("--ctc_loss_alpha", type=float, default=0.0)
+    parser.add_argument("--feature_cache", type=str, default="./LLAVA-ONE-features-3x3/")
 
     args = parser.parse_args()
 
@@ -294,6 +315,8 @@ if __name__ == "__main__":
 
     alva_base = "alva-base"
     from alva.alva_model import AlvaConfig, create_alva_model
+
+    # llama and qwen probably can share the same data collator
     from src.dataset.qwen_av_dataset import WavAudioTransform
     from alva.alva_dataset import AlvaDataCollator
     from alva.alva_processor import AlvaProcessor
@@ -315,6 +338,7 @@ if __name__ == "__main__":
 
     avsr_model.set_audio_mask(args)
     avsr_model.label_smoothing = args.label_smoothing
+    avsr_model.set_ctc_loss_alpha(args.ctc_loss_alpha)
 
     processor = AlvaProcessor.from_pretrained(alva_base, trust_remote_code=True)
     processor.tokenizer.pad_token = processor.tokenizer.eos_token
@@ -325,7 +349,7 @@ if __name__ == "__main__":
     # TODO: more option to control which weights to fine tune
     avsr_model = create_lora(avsr_model, has_vision_tower=True)
 
-    modules = [avsr_model.cross_modal_projector, avsr_model.av_projector]
+    modules = [avsr_model.cross_modal_projector, avsr_model.av_projector, avsr_model.avhubert_encoder]
 
     for module in modules:
         for param in module.parameters():
@@ -338,6 +362,8 @@ if __name__ == "__main__":
         state_dict = load_sharded_state_dict(model_name_or_path)
         avsr_model.load_state_dict(state_dict)
 
+    avsr_model.vision_tower = avsr_model.vision_tower.cpu()
+
     # DATASET CREATION
 
     # Load dataset
@@ -345,19 +371,22 @@ if __name__ == "__main__":
                                                                            include_mcorec=include_mcorec,
                                                                            cache_dir=cache_dir)
 
-    prompt_template = "<|video_bos|><|VIDEO|><|video_eos|><|audio_bos|><|AUDIO|><|audio_eos|>Transcribe this speech:"
+    # TODO: version 1 has VIDEO prompt (which does nothing)
+    prompt_template = "<|audio_bos|><|AUDIO|><|audio_eos|>Transcribe this speech:"
     train_av_data_collator = AlvaDataCollator(processor,
                                               prompt_template=prompt_template,
                                               video_transform=VideoTransform(subset="train"),
                                               audio_transform=WavAudioTransform(subset="train",
                                                                                 speech_dataset=interference_dataset),
-                                              text_transform=text_transform
+                                              text_transform=text_transform,
+                                              feature_cache=args.feature_cache
                                               )
     valid_av_data_collator = AlvaDataCollator(processor,
                                               prompt_template=prompt_template,
                                               video_transform=VideoTransform(subset="train"),
                                               audio_transform=WavAudioTransform(subset="test"),
-                                              text_transform=text_transform
+                                              text_transform=text_transform,
+                                              feature_cache=args.feature_cache
                                               )
 
     print("train_dataset\n", train_dataset)
@@ -406,7 +435,8 @@ if __name__ == "__main__":
         disable_tqdm=args.no_progress_bar,
         # dispatch_batches=False
         ddp_find_unused_parameters=True,
-        ignore_data_skip=True
+        ignore_data_skip=True,
+        dataloader_prefetch_factor=1 # this might help with memory?
     )
 
     trainer = AVSRTrainer(
